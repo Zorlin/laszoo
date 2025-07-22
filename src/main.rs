@@ -4,10 +4,11 @@ mod error;
 mod fs;
 mod logging;
 mod enrollment;
+mod template;
 
 use clap::Parser;
 use tracing::{info, error, debug};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use crate::cli::{Cli, Commands, GroupCommands};
 use crate::config::Config;
 use crate::error::{Result, LaszooError};
@@ -56,10 +57,8 @@ async fn run() -> Result<()> {
             // TODO: Implement rollback
             println!("Rollback not yet implemented");
         }
-        Commands::Apply { template, output } => {
-            info!("Applying template {:?}", template);
-            // TODO: Implement template application
-            println!("Template application not yet implemented");
+        Commands::Apply { template, output: _ } => {
+            apply_template(&config, &template).await?;
         }
         Commands::Group { command } => {
             handle_group_command(command).await?;
@@ -191,6 +190,47 @@ async fn enroll_files(
     } else {
         Ok(())
     }
+}
+
+async fn apply_template(config: &Config, template_path: &Path) -> Result<()> {
+    use crate::template::TemplateEngine;
+    use std::collections::HashMap;
+    
+    // Read template file
+    let template_content = std::fs::read_to_string(template_path)
+        .map_err(|_| LaszooError::FileNotFound { 
+            path: template_path.to_path_buf() 
+        })?;
+    
+    // Create template engine
+    let engine = TemplateEngine::new()?;
+    
+    // Get hostname for variables
+    let hostname = gethostname::gethostname()
+        .to_string_lossy()
+        .to_string();
+    
+    // Build default variables
+    let mut variables = HashMap::new();
+    variables.insert("hostname".to_string(), serde_json::json!(hostname));
+    variables.insert("laszoo_dir".to_string(), serde_json::json!(config.laszoo_dir));
+    
+    // Add environment variables
+    for (key, value) in std::env::vars() {
+        if key.starts_with("LASZOO_") {
+            let var_name = key.strip_prefix("LASZOO_").unwrap().to_lowercase();
+            variables.insert(var_name, serde_json::json!(value));
+        }
+    }
+    
+    // Process template (preserve quack tags by default)
+    let result = engine.process_template(&template_content, &variables, true)?;
+    
+    // Output result
+    println!("{}", result);
+    
+    info!("Successfully processed template {:?}", template_path);
+    Ok(())
 }
 
 async fn handle_group_command(command: GroupCommands) -> Result<()> {
