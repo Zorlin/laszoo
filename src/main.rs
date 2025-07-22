@@ -5,6 +5,7 @@ mod fs;
 mod logging;
 mod enrollment;
 mod template;
+mod monitor;
 
 use clap::Parser;
 use tracing::{info, error, debug};
@@ -47,10 +48,8 @@ async fn run() -> Result<()> {
             // TODO: Implement sync
             println!("Sync not yet implemented");
         }
-        Commands::Status { group, detailed } => {
-            info!("Showing status");
-            // TODO: Implement status
-            println!("Status not yet implemented");
+        Commands::Status { group: _, detailed: _ } => {
+            show_status(&config).await?;
         }
         Commands::Rollback { target, commits } => {
             info!("Rolling back {} commits for {}", commits, target);
@@ -230,6 +229,60 @@ async fn apply_template(config: &Config, template_path: &Path) -> Result<()> {
     println!("{}", result);
     
     info!("Successfully processed template {:?}", template_path);
+    Ok(())
+}
+
+async fn show_status(config: &Config) -> Result<()> {
+    use crate::enrollment::EnrollmentManager;
+    
+    // Ensure distributed filesystem is available
+    crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
+    
+    // Create enrollment manager
+    let manager = EnrollmentManager::new(
+        config.mfs_mount.clone(),
+        config.laszoo_dir.clone()
+    );
+    
+    // Load manifest and show enrolled files
+    let manifest = manager.load_manifest()?;
+    
+    println!("=== Laszoo Status ===");
+    println!("MooseFS Mount: {:?}", config.mfs_mount);
+    println!("Hostname: {}", gethostname::gethostname().to_string_lossy());
+    println!();
+    
+    if manifest.entries.is_empty() {
+        println!("No files enrolled.");
+    } else {
+        println!("Enrolled Files:");
+        
+        // Group by group name
+        let mut groups: std::collections::HashMap<String, Vec<_>> = std::collections::HashMap::new();
+        for (path, entry) in &manifest.entries {
+            groups.entry(entry.group.clone())
+                .or_insert_with(Vec::new)
+                .push((path, entry));
+        }
+        
+        for (group, files) in groups {
+            println!("\n  Group: {}", group);
+            for (path, entry) in files {
+                let status = manager.check_file_status(path)?
+                    .map(|s| match s {
+                        crate::enrollment::FileStatus::Unchanged => "✓",
+                        crate::enrollment::FileStatus::Modified => "●",
+                    })
+                    .unwrap_or("✗");
+                    
+                println!("    {} {:?}", status, path);
+                if let Some(last_synced) = &entry.last_synced {
+                    println!("       Last synced: {}", last_synced.format("%Y-%m-%d %H:%M:%S"));
+                }
+            }
+        }
+    }
+    
     Ok(())
 }
 
