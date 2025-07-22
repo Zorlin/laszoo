@@ -3,12 +3,14 @@ mod config;
 mod error;
 mod fs;
 mod logging;
+mod enrollment;
 
 use clap::Parser;
 use tracing::{info, error, debug};
-use crate::cli::{Cli, Commands, GroupCommands, SyncStrategy};
+use std::path::PathBuf;
+use crate::cli::{Cli, Commands, GroupCommands};
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{Result, LaszooError};
 
 #[tokio::main]
 async fn main() {
@@ -36,10 +38,8 @@ async fn run() -> Result<()> {
         Commands::Init { mfs_mount } => {
             init_laszoo(&config, &mfs_mount).await?;
         }
-        Commands::Enroll { group, path, force, include_hidden } => {
-            info!("Enrolling {:?} into group '{}'", path, group);
-            // TODO: Implement enrollment
-            println!("Enrollment not yet implemented");
+        Commands::Enroll { group, paths, force, include_hidden } => {
+            enroll_files(&config, &group, paths, force, include_hidden).await?;
         }
         Commands::Sync { group, strategy } => {
             info!("Synchronizing with strategy: {:?}", strategy);
@@ -110,6 +110,87 @@ async fn init_laszoo(config: &Config, mfs_mount: &std::path::Path) -> Result<()>
     info!("Laszoo initialized successfully!");
     
     Ok(())
+}
+
+async fn enroll_files(
+    config: &Config, 
+    group: &str, 
+    paths: Vec<PathBuf>, 
+    force: bool,
+    include_hidden: bool
+) -> Result<()> {
+    use crate::enrollment::EnrollmentManager;
+    
+    // Ensure distributed filesystem is available
+    crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
+    
+    // Create enrollment manager
+    let manager = EnrollmentManager::new(
+        config.mfs_mount.clone(),
+        config.laszoo_dir.clone()
+    );
+    
+    let mut enrolled_count = 0;
+    let mut error_count = 0;
+    
+    for path in paths {
+        // Expand path if it's a directory
+        let files = if path.is_dir() {
+            let mut files = Vec::new();
+            for entry in walkdir::WalkDir::new(&path)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|e| {
+                    // Skip hidden files unless requested
+                    if !include_hidden && e.file_name()
+                        .to_str()
+                        .map_or(false, |s| s.starts_with('.')) {
+                        return false;
+                    }
+                    true
+                })
+            {
+                match entry {
+                    Ok(e) if e.file_type().is_file() => {
+                        files.push(e.path().to_path_buf());
+                    }
+                    Err(e) => {
+                        error!("Error walking directory: {}", e);
+                        error_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+            files
+        } else {
+            vec![path]
+        };
+        
+        // Enroll each file
+        for file_path in files {
+            match manager.enroll_file(&file_path, group, force) {
+                Ok(_) => {
+                    info!("Enrolled: {:?}", file_path);
+                    enrolled_count += 1;
+                }
+                Err(e) => {
+                    error!("Failed to enroll {:?}: {}", file_path, e);
+                    error_count += 1;
+                }
+            }
+        }
+    }
+    
+    info!("Enrollment complete: {} files enrolled, {} errors", 
+          enrolled_count, error_count);
+    
+    if error_count > 0 {
+        Err(LaszooError::Other(
+            format!("Enrollment completed with {} errors", error_count)
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 async fn handle_group_command(command: GroupCommands) -> Result<()> {

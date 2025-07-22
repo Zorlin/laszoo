@@ -39,7 +39,7 @@ git2 = "0.19"
 reqwest = { version = "0.12", features = ["json"] }
 
 # Utilities
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 dirs = "5.0"
 gethostname = "0.5"

@@ -29,8 +29,9 @@ pub enum Commands {
         /// Group name to enroll files into
         group: String,
         
-        /// Path to file or directory to enroll
-        path: PathBuf,
+        /// Paths to files or directories to enroll
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
         
         /// Force re-enrollment if already enrolled
         #[arg(short, long)]
