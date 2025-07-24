@@ -96,6 +96,17 @@ pub enum Commands {
         #[arg(long, default_value = "/mnt/mfs")]
         mfs_mount: PathBuf,
     },
+    
+    /// Commit changes with AI-generated message
+    Commit {
+        /// Additional context for commit message generation
+        #[arg(short, long)]
+        message: Option<String>,
+        
+        /// Stage all changes before committing
+        #[arg(short, long)]
+        all: bool,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]

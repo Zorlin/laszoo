@@ -7,9 +7,10 @@ mod enrollment;
 mod template;
 mod monitor;
 mod sync;
+mod git;
 
 use clap::Parser;
-use tracing::{info, error, debug};
+use tracing::{info, error, debug, warn};
 use std::path::{Path, PathBuf};
 use crate::cli::{Cli, Commands, GroupCommands};
 use crate::config::Config;
@@ -40,6 +41,9 @@ async fn run() -> Result<()> {
     match cli.command {
         Commands::Init { mfs_mount } => {
             init_laszoo(&config, &mfs_mount).await?;
+        }
+        Commands::Commit { message, all } => {
+            commit_changes(&config, message.as_deref(), all).await?;
         }
         Commands::Enroll { group, paths, force, include_hidden } => {
             enroll_files(&config, &group, paths, force, include_hidden).await?;
@@ -346,6 +350,69 @@ async fn sync_files(
         }
     }
     
+    Ok(())
+}
+
+async fn commit_changes(
+    config: &Config,
+    user_message: Option<&str>,
+    stage_all: bool,
+) -> Result<()> {
+    use crate::git::GitManager;
+    
+    // Use the laszoo directory as the git repo
+    let repo_path = crate::fs::get_laszoo_base(&config.mfs_mount, &config.laszoo_dir);
+    let git = GitManager::new(repo_path);
+    
+    // Check if there are changes
+    if !git.has_changes()? {
+        info!("No changes to commit");
+        return Ok(());
+    }
+    
+    // Show status
+    let statuses = git.get_status()?;
+    println!("Git status:");
+    for (path, status) in &statuses {
+        let status_char = match status {
+            s if s.contains(git2::Status::INDEX_NEW) => "A",
+            s if s.contains(git2::Status::INDEX_MODIFIED) => "M",
+            s if s.contains(git2::Status::INDEX_DELETED) => "D",
+            s if s.contains(git2::Status::WT_NEW) => "?",
+            s if s.contains(git2::Status::WT_MODIFIED) => "M",
+            s if s.contains(git2::Status::WT_DELETED) => "D",
+            _ => " ",
+        };
+        println!("  {} {:?}", status_char, path);
+    }
+    
+    // Stage files if requested
+    if stage_all {
+        info!("Staging all changes");
+        git.stage_all()?;
+    } else {
+        // Check if anything is staged
+        let has_staged = statuses.iter().any(|(_, s)| {
+            s.contains(git2::Status::INDEX_NEW) ||
+            s.contains(git2::Status::INDEX_MODIFIED) ||
+            s.contains(git2::Status::INDEX_DELETED)
+        });
+        
+        if !has_staged {
+            warn!("No files staged for commit. Use --all to stage all changes.");
+            return Ok(());
+        }
+    }
+    
+    // Create commit with AI-generated message
+    info!("Generating commit message with {}", config.ollama_model);
+    let commit_id = git.commit_with_ai(
+        &config.ollama_endpoint,
+        &config.ollama_model,
+        user_message,
+    ).await?;
+    
+    info!("Successfully created commit: {}", commit_id);
     Ok(())
 }
 

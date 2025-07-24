@@ -220,7 +220,7 @@ fn default_ollama_endpoint() -> String {
 }
 
 fn default_ollama_model() -> String {
-    "llama3.2".to_string()
+    "qwen3:14b".to_string()
 }
 
 fn default_true() -> bool {
