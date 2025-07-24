@@ -236,14 +236,14 @@ impl GitManager {
             .map_err(|e| LaszooError::Http(e))?;
             
         // Clean up the response - remove thinking tags if present
-        let mut message = ollama_response.response.trim();
+        let mut message = ollama_response.response.trim().to_string();
         
         // Remove <think> tags if present
         if let Some(start) = message.find("<think>") {
             if let Some(end) = message.find("</think>") {
-                let before = &message[..start];
-                let after = &message[end + 8..];
-                message = &format!("{}{}", before, after);
+                let before = message[..start].to_string();
+                let after = message[end + 8..].to_string();
+                message = format!("{}{}", before, after);
             }
         }
         

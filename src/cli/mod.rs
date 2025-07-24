@@ -150,7 +150,7 @@ pub enum GroupCommands {
         group: String,
         
         /// Host to add (current host if not specified)
-        #[arg(short, long)]
+        #[arg(long)]
         host: Option<String>,
     },
     
@@ -160,7 +160,7 @@ pub enum GroupCommands {
         group: String,
         
         /// Host to remove (current host if not specified)
-        #[arg(short, long)]
+        #[arg(long)]
         host: Option<String>,
     },
 }

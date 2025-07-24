@@ -8,6 +8,7 @@ mod template;
 mod monitor;
 mod sync;
 mod git;
+mod group;
 
 use clap::Parser;
 use tracing::{info, error, debug, warn};
@@ -417,37 +418,65 @@ async fn commit_changes(
 }
 
 async fn handle_group_command(command: GroupCommands) -> Result<()> {
+    use crate::group::GroupManager;
+    
+    // Load config to get MFS mount and laszoo dir
+    let config = Config::load(None)?;
+    
+    // Ensure distributed filesystem is available
+    crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
+    
+    // Create group manager
+    let manager = GroupManager::new(
+        config.mfs_mount.clone(),
+        config.laszoo_dir.clone()
+    );
+    
     match command {
         GroupCommands::Create { name, description } => {
             info!("Creating group '{}' with description: {:?}", name, description);
-            // TODO: Implement group creation
-            println!("Group creation not yet implemented");
+            manager.create_group(&name, description)?;
+            println!("Successfully created group '{}'", name);
         }
         GroupCommands::List => {
             info!("Listing groups");
-            // TODO: Implement group listing
-            println!("Group listing not yet implemented");
+            let groups = manager.list_groups()?;
+            
+            if groups.is_empty() {
+                println!("No groups defined.");
+            } else {
+                println!("Groups:");
+                for group in groups {
+                    println!("\n  {} - {}", 
+                        group.name, 
+                        group.description.as_deref().unwrap_or("No description"));
+                    if !group.hosts.is_empty() {
+                        println!("    Hosts: {}", group.hosts.iter().cloned().collect::<Vec<_>>().join(", "));
+                    }
+                    println!("    Created: {}", group.created_at.format("%Y-%m-%d %H:%M:%S"));
+                }
+            }
         }
         GroupCommands::Delete { name, force } => {
             info!("Deleting group '{}' (force: {})", name, force);
-            // TODO: Implement group deletion
-            println!("Group deletion not yet implemented");
+            manager.delete_group(&name, force)?;
+            println!("Successfully deleted group '{}'", name);
         }
         GroupCommands::AddHost { group, host } => {
             let hostname = host.unwrap_or_else(|| {
                 gethostname::gethostname().to_string_lossy().to_string()
             });
             info!("Adding host '{}' to group '{}'", hostname, group);
-            // TODO: Implement host addition
-            println!("Host addition not yet implemented");
+            manager.add_host_to_group(&group, &hostname)?;
+            println!("Successfully added host '{}' to group '{}'", hostname, group);
         }
         GroupCommands::RemoveHost { group, host } => {
             let hostname = host.unwrap_or_else(|| {
                 gethostname::gethostname().to_string_lossy().to_string()
             });
             info!("Removing host '{}' from group '{}'", hostname, group);
-            // TODO: Implement host removal
-            println!("Host removal not yet implemented");
+            manager.remove_host_from_group(&group, &hostname)?;
+            println!("Successfully removed host '{}' from group '{}'", hostname, group);
         }
     }
     
