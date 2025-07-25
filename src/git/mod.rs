@@ -90,7 +90,7 @@ impl GitManager {
         Ok(())
     }
     
-    /// Create a commit with an AI-generated message
+    /// Create a commit with an AI-generated message (with fallback to generic message)
     pub async fn commit_with_ai(
         &self,
         ollama_endpoint: &str,
@@ -106,13 +106,19 @@ impl GitManager {
             return Err(LaszooError::Other("No staged changes to commit".to_string()));
         }
         
-        // Generate commit message using Ollama
-        let commit_message = self.generate_commit_message(
+        // Try to generate commit message using Ollama, fall back to generic if it fails
+        let commit_message = match self.generate_commit_message(
             ollama_endpoint,
             ollama_model,
             &diff_text,
             user_context
-        ).await?;
+        ).await {
+            Ok(message) => message,
+            Err(e) => {
+                warn!("Failed to generate AI commit message: {}. Using generic message.", e);
+                self.generate_generic_commit_message(&diff_text, user_context)
+            }
+        };
         
         // Create the commit
         let signature = self.get_signature()?;
@@ -253,6 +259,93 @@ impl GitManager {
         let final_message = format!("{}\n\n🦎 Laszoo: AI-generated commit message", message);
         
         Ok(final_message)
+    }
+    
+    /// Generate a generic commit message based on diff analysis
+    fn generate_generic_commit_message(&self, diff: &str, user_context: Option<&str>) -> String {
+        let mut added_files = 0;
+        let mut modified_files = 0;
+        let mut deleted_files = 0;
+        let mut added_lines = 0;
+        let mut deleted_lines = 0;
+        
+        // Parse the diff to understand what changed
+        for line in diff.lines() {
+            if line.starts_with("diff --git") {
+                // Count file modifications
+                if line.contains("/dev/null") {
+                    if line.starts_with("diff --git a/") {
+                        deleted_files += 1;
+                    } else {
+                        added_files += 1;
+                    }
+                } else {
+                    modified_files += 1;
+                }
+            } else if line.starts_with("+") && !line.starts_with("+++") {
+                added_lines += 1;
+            } else if line.starts_with("-") && !line.starts_with("---") {
+                deleted_lines += 1;
+            }
+        }
+        
+        // Generate appropriate commit message based on changes
+        let message = if user_context.is_some() && !user_context.unwrap().is_empty() {
+            user_context.unwrap().to_string()
+        } else if added_files > 0 && modified_files == 0 && deleted_files == 0 {
+            if added_files == 1 {
+                "feat: Add new file"
+            } else {
+                "feat: Add new files"
+            }.to_string()
+        } else if deleted_files > 0 && added_files == 0 && modified_files == 0 {
+            if deleted_files == 1 {
+                "chore: Remove file"
+            } else {
+                "chore: Remove files"
+            }.to_string()
+        } else if modified_files > 0 && added_files == 0 && deleted_files == 0 {
+            if modified_files == 1 {
+                "feat: Update configuration"
+            } else {
+                "feat: Update configurations"
+            }.to_string()
+        } else {
+            // Mixed changes
+            let mut parts = Vec::new();
+            if added_files > 0 {
+                parts.push(format!("{} added", added_files));
+            }
+            if modified_files > 0 {
+                parts.push(format!("{} modified", modified_files));
+            }
+            if deleted_files > 0 {
+                parts.push(format!("{} deleted", deleted_files));
+            }
+            
+            if parts.is_empty() {
+                "feat: Update files".to_string()
+            } else {
+                format!("feat: Update files ({})", parts.join(", "))
+            }
+        };
+        
+        // Add line change statistics if significant
+        let mut stats = Vec::new();
+        if added_lines > 0 {
+            stats.push(format!("+{}", added_lines));
+        }
+        if deleted_lines > 0 {
+            stats.push(format!("-{}", deleted_lines));
+        }
+        
+        let final_message = if !stats.is_empty() && (added_lines + deleted_lines) > 5 {
+            format!("{}\n\n({} lines changed)", message, stats.join("/"))
+        } else {
+            message
+        };
+        
+        format!("{}\n\n🦎 Laszoo: Auto-generated commit message", final_message)
     }
     
     /// Get git signature

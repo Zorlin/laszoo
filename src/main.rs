@@ -13,7 +13,7 @@ mod group;
 use clap::Parser;
 use tracing::{info, error, debug, warn};
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     cli::{Cli, Commands, GroupCommands, GroupsCommands, SyncAction},
@@ -222,6 +222,8 @@ async fn apply_group_templates(config: &Config, group: &str, files: Vec<PathBuf>
     info!("Applying all templates from group '{}'", group);
     
     if files.is_empty() {
+        // Add machine to group first
+        manager.add_machine_to_group(group)?;
         // Apply all templates from the group
         manager.apply_group_templates(group)?;
     } else {
@@ -461,73 +463,126 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                     
                     println!("    {} {} ({})", status, dir_path.display(), status_parts.join(", "));
                     
-                    // Always show new files that need adoption
-                    if new_count > 0 && dir_path.exists() && dir_path.is_dir() {
-                        if let Ok(entries) = std::fs::read_dir(dir_path) {
-                            let mut new_files: Vec<_> = entries.flatten()
-                                .filter_map(|e| {
-                                    let metadata = e.metadata().ok()?;
-                                    if metadata.is_file() {
-                                        let file_path = e.path();
-                                        // Check if template exists
-                                        let template_path = enrollment_manager.get_group_template_path(group_name, &file_path).ok()?;
-                                        if !template_path.exists() {
-                                            Some(file_path)
+                    // Show enrollment timestamp for directory in detailed mode
+                    if detailed {
+                        println!("    Enrolled: {}", entry.enrolled_at.format("%Y-%m-%d %H:%M:%S"));
+                        if let Some(last_synced) = &entry.last_synced {
+                            println!("    Last synced: {}", last_synced.format("%Y-%m-%d %H:%M:%S"));
+                        }
+                        if entry.is_hybrid == Some(true) {
+                            println!("    Mode: hybrid");
+                        }
+                    }
+                    
+                    // Track which new files we show to avoid duplicates in detailed mode
+                    let mut new_files_shown = HashSet::new();
+                    
+                    if dir_path.exists() {
+                        // Always show new files that need adoption
+                        if new_count > 0 && dir_path.is_dir() {
+                            if let Ok(entries) = std::fs::read_dir(dir_path) {
+                                let mut new_files: Vec<_> = entries.flatten()
+                                    .filter_map(|e| {
+                                        let metadata = e.metadata().ok()?;
+                                        if metadata.is_file() {
+                                            let file_path = e.path();
+                                            // Check if template exists
+                                            let template_path = enrollment_manager.get_group_template_path(group_name, &file_path).ok()?;
+                                            if !template_path.exists() {
+                                                Some(file_path)
+                                            } else {
+                                                None
+                                            }
                                         } else {
                                             None
                                         }
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-                            new_files.sort();
-                            
-                            for file_path in new_files {
-                                let relative_path = file_path.strip_prefix(dir_path)
-                                    .unwrap_or(&file_path);
-                                println!("      ? {}", relative_path.display());
+                                    })
+                                    .collect();
+                                new_files.sort();
+                                
+                                for file_path in new_files {
+                                    let relative_path = file_path.strip_prefix(dir_path)
+                                        .unwrap_or(&file_path);
+                                    println!("      ? {} (discovered)", relative_path.display());
+                                    new_files_shown.insert(file_path);
+                                }
                             }
                         }
-                    }
-                } else {
-                    // Directory doesn't exist
-                    println!("    ✗ {} (directory missing)", dir_path.display());
-                }
-                
-                if detailed {
-                    // Show all files when in detailed mode
-                    if dir_path.exists() && dir_path.is_dir() {
-                        if let Ok(entries) = std::fs::read_dir(dir_path) {
-                            let mut files: Vec<_> = entries.flatten()
-                                .filter_map(|e| {
-                                    let metadata = e.metadata().ok()?;
-                                    if metadata.is_file() {
-                                        Some(e.path())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-                            files.sort();
-                            
-                            for file_path in files {
-                                // Check if template exists for this file
-                                let template_path = enrollment_manager.get_group_template_path(group_name, &file_path)?;
-                                
-                                let file_status = if template_path.exists() {
-                                    // Template exists, check if file matches
-                                    if let Ok(template_content) = std::fs::read_to_string(&template_path) {
-                                        if let Ok(file_content) = std::fs::read_to_string(&file_path) {
-                                            // Process template to compare
-                                            if let Ok(processed) = crate::template::process_handlebars(&template_content, &hostname) {
-                                                if processed == file_content {
-                                                    "✓"
+                        
+                        if detailed {
+                            // Show existing files when in detailed mode (but skip new files already shown)
+                            if dir_path.is_dir() {
+                                if let Ok(entries) = std::fs::read_dir(dir_path) {
+                                    let mut files: Vec<_> = entries.flatten()
+                                        .filter_map(|e| {
+                                            let metadata = e.metadata().ok()?;
+                                            if metadata.is_file() {
+                                                Some(e.path())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    files.sort();
+                                    
+                                    for file_path in files {
+                                        // Skip files we already showed as new
+                                        if new_files_shown.contains(&file_path) {
+                                            continue;
+                                        }
+                                        
+                                        // Check if template exists for this file
+                                        let template_path = enrollment_manager.get_group_template_path(group_name, &file_path)?;
+                                        
+                                        let file_status = if template_path.exists() {
+                                            // Template exists, check if file matches
+                                            if let Ok(template_content) = std::fs::read_to_string(&template_path) {
+                                                if let Ok(file_content) = std::fs::read_to_string(&file_path) {
+                                                    // Process template to compare
+                                                    if let Ok(processed) = crate::template::process_handlebars(&template_content, &hostname) {
+                                                        if processed == file_content {
+                                                            "✓"
+                                                        } else {
+                                                            "●"
+                                                        }
+                                                    } else {
+                                                        "?"
+                                                    }
                                                 } else {
-                                                    "●"
+                                                    "?"
                                                 }
                                             } else {
                                                 "?"
+                                            }
+                                        } else {
+                                            continue; // Skip new files - already shown above
+                                        };
+                                        
+                                        let relative_path = file_path.strip_prefix(dir_path)
+                                            .unwrap_or(&file_path);
+                                        println!("      {} {}", file_status, relative_path.display());
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Directory doesn't exist
+                        println!("    ✗ {} (directory missing)", dir_path.display());
+                    }
+                } else {
+                    // Handle individual file enrollment
+                    let file_path = path;
+                    let status = if file_path.exists() {
+                        // Check if file matches template
+                        if let Some(template_path) = &entry.template_path {
+                            if template_path.exists() {
+                                if let Ok(template_content) = std::fs::read_to_string(template_path) {
+                                    if let Ok(file_content) = std::fs::read_to_string(file_path) {
+                                        if let Ok(processed) = crate::template::process_handlebars(&template_content, &hostname) {
+                                            if processed == file_content {
+                                                "✓"
+                                            } else {
+                                                "●"
                                             }
                                         } else {
                                             "?"
@@ -536,57 +591,17 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                                         "?"
                                     }
                                 } else {
-                                    "?"  // No template yet
-                                };
-                                
-                                let relative_path = file_path.strip_prefix(dir_path)
-                                    .unwrap_or(&file_path);
-                                println!("      {} {}", file_status, relative_path.display());
-                            }
-                        }
-                    }
-                    
-                    if let Some(last_synced) = &entry.last_synced {
-                        println!("      Last synced: {}", last_synced.format("%Y-%m-%d %H:%M:%S"));
-                    }
-                    println!("      Enrolled: {}", entry.enrolled_at.format("%Y-%m-%d %H:%M:%S"));
-                    if entry.is_hybrid == Some(true) {
-                        println!("      Mode: hybrid");
-                    }
-                }
-            } else {
-                // Handle individual file enrollment
-                let file_path = path;
-                let status = if file_path.exists() {
-                    // Check if file matches template
-                    if let Some(template_path) = &entry.template_path {
-                        if template_path.exists() {
-                            if let Ok(template_content) = std::fs::read_to_string(template_path) {
-                                if let Ok(file_content) = std::fs::read_to_string(file_path) {
-                                    if let Ok(processed) = crate::template::process_handlebars(&template_content, &hostname) {
-                                        if processed == file_content {
-                                            "✓"
-                                        } else {
-                                            "●"
-                                        }
-                                    } else {
-                                        "?"
-                                    }
-                                } else {
                                     "?"
                                 }
                             } else {
-                                "?"
+                                "✗" // Template missing
                             }
                         } else {
-                            "✗" // Template missing
+                            "?" // No template path
                         }
                     } else {
-                        "?" // No template path
-                    }
-                } else {
-                    "✗" // File missing
-                };
+                        "✗" // File missing
+                    };
                 
                 println!("    {} {}", status, file_path.display());
                 
@@ -602,11 +617,12 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                         println!("      Mode: hybrid");
                     }
                 }
+                }
             }
         }
     }
     
-    println!("\nLegend: ✓ = unchanged, ● = modified locally, ✗ = missing");
+    println!("\nLegend: ✓ = unchanged, ● = modified locally, ✗ = missing, ? = discovered");
     
     Ok(())
 }
@@ -1126,6 +1142,11 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
     let mut enrolled_files = HashSet::new();
     
     for group_name in &groups_to_watch {
+        // Watch the group directory for new templates
+        let group_dir = crate::fs::get_group_dir(&config.mfs_mount, "", group_name);
+        watch_paths.insert(group_dir.clone());
+        path_to_group_map.insert(group_dir, group_name.clone());
+        
         // Load both group and machine manifests
         if let Ok(group_manifest) = enrollment_manager.load_group_manifest(group_name) {
             for (path, entry) in &group_manifest.entries {
@@ -1306,9 +1327,36 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
     // Process events
     let mut debounce_buffer = HashSet::new();
     let mut template_changes = HashSet::new();
+    let mut local_file_changes = HashSet::new(); // Track local file changes
+    let mut local_template_changes = HashSet::new(); // Track template changes that originated locally
+    let mut ignore_file_changes = HashSet::new(); // Track files we're currently applying templates to (ignore subsequent changes)
     let debounce_duration = Duration::from_millis(500);
     let mut last_event_time = std::time::Instant::now();
     let mut last_template_time = std::time::Instant::now();
+    let mut last_template_scan = std::time::Instant::now();
+    let template_scan_interval = Duration::from_secs(10); // Scan every 10 seconds
+    let mut known_templates: HashSet<PathBuf> = HashSet::new();
+    let mut known_template_timestamps: std::collections::HashMap<PathBuf, std::time::SystemTime> = std::collections::HashMap::new();
+    
+    // Initial scan of templates
+    for group_name in &groups_to_watch {
+        let group_dir = crate::fs::get_group_dir(&config.mfs_mount, "", group_name);
+        for entry in walkdir::WalkDir::new(&group_dir) {
+            if let Ok(entry) = entry {
+                if entry.file_type().is_file() && entry.path().extension() == Some(std::ffi::OsStr::new("lasz")) {
+                    let template_path = entry.path().to_path_buf();
+                    known_templates.insert(template_path.clone());
+                    
+                    // Record initial timestamp
+                    if let Ok(metadata) = std::fs::metadata(&template_path) {
+                        if let Ok(modified) = metadata.modified() {
+                            known_template_timestamps.insert(template_path, modified);
+                        }
+                    }
+                }
+            }
+        }
+    }
     
     loop {
         // Check for events with timeout
@@ -1341,8 +1389,9 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                                     }
                                 }
                                 
-                                if should_track {
-                                    debounce_buffer.insert(path);
+                                if should_track && !ignore_file_changes.contains(&path) {
+                                    debounce_buffer.insert(path.clone());
+                                    local_file_changes.insert(path); // Track this as a local change
                                     last_event_time = std::time::Instant::now();
                                 }
                             }
@@ -1442,6 +1491,10 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                                         Ok(template_changed) => {
                                             if template_changed {
                                                 println!("✓ Updated template for {}", path.display());
+                                                
+                                                // Track that this template change originated from local file change
+                                                let template_path = enrollment_manager.get_group_template_path(&group_name, path)?;
+                                                local_template_changes.insert(template_path);
                                             }
                                         }
                                         Err(e) => {
@@ -1461,22 +1514,136 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                     println!(); // Add blank line for readability
                 }
                 
-                // Check if we should commit template changes
+                // Check if we should process template changes
                 if !template_changes.is_empty() && 
                    last_template_time.elapsed() > debounce_duration {
                     
                     debug!("Template changes detected: {} files", template_changes.len());
                     
-                    // Auto-commit template changes
-                    if config.auto_commit {
-                        println!("\nAuto-committing template changes...");
-                        if let Err(e) = commit_changes(config, Some("Template changes from watch mode"), true).await {
+                    // Apply new templates automatically
+                    println!("\n[{}] Template changes detected, applying...", 
+                        chrono::Local::now().format("%H:%M:%S"));
+                    
+                    for group_name in &groups_to_watch {
+                        if let Err(e) = enrollment_manager.apply_group_templates(group_name) {
+                            error!("Failed to apply templates for group '{}': {}", group_name, e);
+                        } else {
+                            debug!("Applied templates for group '{}'", group_name);
+                        }
+                    }
+                    
+                    // Only auto-commit template changes that originated from local file changes
+                    if config.auto_commit && !local_template_changes.is_empty() {
+                        println!("Auto-committing {} local template changes...", local_template_changes.len());
+                        if let Err(e) = commit_changes(config, Some("Template changes from local file modifications"), true).await {
                             error!("Failed to auto-commit template changes: {}", e);
                         }
                     }
                     
-                    // Clear the template changes buffer
+                    // Clear the buffers
                     template_changes.clear();
+                    local_template_changes.clear();
+                }
+                
+                // Periodic template scanning for MooseFS (since inotify doesn't work)
+                if last_template_scan.elapsed() > template_scan_interval {
+                    debug!("Performing periodic template scan...");
+                    
+                    for group_name in &groups_to_watch {
+                        let group_dir = crate::fs::get_group_dir(&config.mfs_mount, "", group_name);
+                        
+                        for entry in walkdir::WalkDir::new(&group_dir) {
+                            if let Ok(entry) = entry {
+                                if entry.file_type().is_file() && entry.path().extension() == Some(std::ffi::OsStr::new("lasz")) {
+                                    let template_path = entry.path().to_path_buf();
+                                    
+                                    // Check if this is a new template or if it has been modified
+                                    let is_new = !known_templates.contains(&template_path);
+                                    let mut is_modified = false;
+                                    
+                                    if !is_new {
+                                        // Check if timestamp changed
+                                        if let Ok(metadata) = std::fs::metadata(&template_path) {
+                                            if let Ok(modified) = metadata.modified() {
+                                                if let Some(known_time) = known_template_timestamps.get(&template_path) {
+                                                    if modified != *known_time {
+                                                        is_modified = true;
+                                                        known_template_timestamps.insert(template_path.clone(), modified);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        // New template - record its timestamp
+                                        if let Ok(metadata) = std::fs::metadata(&template_path) {
+                                            if let Ok(modified) = metadata.modified() {
+                                                known_template_timestamps.insert(template_path.clone(), modified);
+                                            }
+                                        }
+                                    }
+                                    
+                                    if is_new || is_modified {
+                                        // Extract the original file path from template path
+                                        if let Ok(relative_path) = template_path.strip_prefix(&group_dir) {
+                                            let path_str = relative_path.to_string_lossy();
+                                            if path_str.ends_with(".lasz") {
+                                                let original_path = PathBuf::from("/").join(&path_str[..path_str.len() - 5]);
+                                                
+                                                // Check if this template change was triggered by a local file change
+                                                let was_local_change = local_file_changes.contains(&original_path);
+                                                
+                                                if is_new {
+                                                    println!("\n[{}] New template detected: {}", 
+                                                        chrono::Local::now().format("%H:%M:%S"),
+                                                        template_path.display()
+                                                    );
+                                                } else if is_modified {
+                                                    println!("\n[{}] Template modified: {}", 
+                                                        chrono::Local::now().format("%H:%M:%S"),
+                                                        template_path.display()
+                                                    );
+                                                }
+                                                
+                                                known_templates.insert(template_path.clone());
+                                                
+                                                // Only auto-apply if this wasn't a local change and auto mode is enabled
+                                                if !was_local_change && auto {
+                                                    println!("  → Auto-applying template change from remote machine");
+                                                    
+                                                    // Add to ignore list before applying
+                                                    ignore_file_changes.insert(original_path.clone());
+                                                    
+                                                    // Apply this specific template
+                                                    if let Err(e) = enrollment_manager.apply_single_template(&template_path, &original_path) {
+                                                        error!("Failed to apply template {:?}: {}", template_path, e);
+                                                        println!("  ✗ Failed to apply template: {}", e);
+                                                    } else {
+                                                        println!("  ✓ Applied template change to {}", original_path.display());
+                                                    }
+                                                } else if was_local_change {
+                                                    println!("  → Skipping auto-apply (originated from local file change)");
+                                                } else if !auto {
+                                                    println!("  → Template change detected (manual mode - run 'laszoo apply {}' to apply)", group_name);
+                                                }
+                                                
+                                                template_changes.insert(template_path);
+                                                last_template_time = std::time::Instant::now();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Clear local file changes that are older than template scan interval
+                    // This prevents false positives where we think a template change was local
+                    local_file_changes.clear();
+                    
+                    // Also clear ignore list to allow monitoring files again
+                    ignore_file_changes.clear();
+                    
+                    last_template_scan = std::time::Instant::now();
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
