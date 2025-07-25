@@ -278,9 +278,7 @@ impl EnrollmentManager {
         
         let abs_path = dir_path.canonicalize()?;
         
-        // Just enroll the directory itself, not individual files
-        // The filesystem is the source of truth for directory contents
-        
+        // First enroll the directory itself as a marker
         if machine_specific {
             // Create machine-specific directory entry
             let mut machine_manifest = self.load_manifest()?;

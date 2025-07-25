@@ -354,145 +354,150 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
         // Load from group manifest
         if let Ok(group_manifest) = enrollment_manager.load_group_manifest(group_name) {
             for (path, entry) in group_manifest.entries {
-                // Only include directory enrollments (checksum == "directory")
-                if entry.checksum == "directory" {
-                    enrollments.insert(path, entry);
-                }
+                enrollments.insert(path, entry);
             }
         }
         
         // Load from machine manifest (machine-specific enrollments)
         let machine_manifest = enrollment_manager.load_manifest()?;
         for (path, entry) in &machine_manifest.entries {
-            if &entry.group == group_name && entry.checksum == "directory" {
+            if &entry.group == group_name {
                 enrollments.insert(path.clone(), entry.clone());
             }
         }
         
         if enrollments.is_empty() {
-            println!("    (no directories enrolled)");
+            println!("    (nothing enrolled)");
             continue;
         }
         
-        // Show enrolled directories with summarized status
-        let mut dirs: Vec<_> = enrollments.iter().collect();
-        dirs.sort_by(|a, b| a.0.cmp(&b.0));
+        // Sort enrollments by path
+        let mut entries: Vec<_> = enrollments.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
         
-        for (dir_path, entry) in dirs {
-            // Count file statuses in directory
-            let mut file_count = 0;
-            let mut unchanged_count = 0;
-            let mut modified_count = 0;
-            let mut missing_count = 0;
-            let mut new_count = 0;
-            
-            if dir_path.exists() && dir_path.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(dir_path) {
-                    for entry in entries.flatten() {
-                        if let Ok(metadata) = entry.metadata() {
-                            if metadata.is_file() {
-                                file_count += 1;
-                                let file_path = entry.path();
-                                
+        for (path, entry) in entries {
+            // Check if this is a directory or file enrollment
+            if entry.checksum == "directory" {
+                // Handle directory enrollment
+                let dir_path = path;
+                
+                // Count file statuses in directory
+                let mut file_count = 0;
+                let mut unchanged_count = 0;
+                let mut modified_count = 0;
+                let mut missing_count = 0;
+                let mut new_count = 0;
+                
+                if dir_path.exists() && dir_path.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(dir_path) {
+                        for entry in entries.flatten() {
+                            if let Ok(metadata) = entry.metadata() {
+                                if metadata.is_file() {
+                                    file_count += 1;
+                                    let file_path = entry.path();
+                                    
+                                    // Check if template exists for this file
+                                    let template_path = enrollment_manager.get_group_template_path(group_name, &file_path)?;
+                                    
+                                    if template_path.exists() {
+                                        // Template exists, check if file matches
+                                        if let Ok(template_content) = std::fs::read_to_string(&template_path) {
+                                            if let Ok(file_content) = std::fs::read_to_string(&file_path) {
+                                                // Process template to compare
+                                                if let Ok(processed) = crate::template::process_handlebars(&template_content, &hostname) {
+                                                    if processed == file_content {
+                                                        unchanged_count += 1;
+                                                    } else {
+                                                        modified_count += 1;
+                                                    }
+                                                } else {
+                                                    modified_count += 1; // Can't process, assume modified
+                                                }
+                                            } else {
+                                                missing_count += 1; // Can't read file
+                                            }
+                                        } else {
+                                            missing_count += 1; // Can't read template
+                                        }
+                                    } else {
+                                        new_count += 1; // No template yet
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Determine overall directory status
+                    let status = if modified_count > 0 {
+                        "●"
+                    } else if missing_count > 0 {
+                        "✗"
+                    } else {
+                        "✓"
+                    };
+                    
+                    // Build status string
+                    let mut status_parts = vec![format!("1 directory, {} files", file_count)];
+                    
+                    if unchanged_count > 0 {
+                        let percent = (unchanged_count * 100) / file_count;
+                        status_parts.push(format!("✓ {}% ok ({}/{})", percent, unchanged_count, file_count));
+                    }
+                    
+                    if modified_count > 0 {
+                        let percent = (modified_count * 100) / file_count;
+                        status_parts.push(format!("● {}% modified ({}/{})", percent, modified_count, file_count));
+                    }
+                    
+                    if missing_count > 0 {
+                        let percent = (missing_count * 100) / file_count;
+                        status_parts.push(format!("✗ {}% missing ({}/{})", percent, missing_count, file_count));
+                    }
+                    
+                    if new_count > 0 {
+                        let percent = (new_count * 100) / file_count;
+                        status_parts.push(format!("? {}% new ({}/{})", percent, new_count, file_count));
+                    }
+                    
+                    println!("    {} {} ({})", status, dir_path.display(), status_parts.join(", "));
+                } else {
+                    // Directory doesn't exist
+                    println!("    ✗ {} (directory missing)", dir_path.display());
+                }
+                
+                if detailed {
+                    // Show individual files when in detailed mode
+                    if dir_path.exists() && dir_path.is_dir() {
+                        if let Ok(entries) = std::fs::read_dir(dir_path) {
+                            let mut files: Vec<_> = entries.flatten()
+                                .filter_map(|e| {
+                                    let metadata = e.metadata().ok()?;
+                                    if metadata.is_file() {
+                                        Some(e.path())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            files.sort();
+                            
+                            for file_path in files {
                                 // Check if template exists for this file
                                 let template_path = enrollment_manager.get_group_template_path(group_name, &file_path)?;
                                 
-                                if template_path.exists() {
+                                let file_status = if template_path.exists() {
                                     // Template exists, check if file matches
                                     if let Ok(template_content) = std::fs::read_to_string(&template_path) {
                                         if let Ok(file_content) = std::fs::read_to_string(&file_path) {
                                             // Process template to compare
                                             if let Ok(processed) = crate::template::process_handlebars(&template_content, &hostname) {
                                                 if processed == file_content {
-                                                    unchanged_count += 1;
+                                                    "✓"
                                                 } else {
-                                                    modified_count += 1;
+                                                    "●"
                                                 }
                                             } else {
-                                                modified_count += 1; // Can't process, assume modified
-                                            }
-                                        } else {
-                                            missing_count += 1; // Can't read file
-                                        }
-                                    } else {
-                                        missing_count += 1; // Can't read template
-                                    }
-                                } else {
-                                    new_count += 1; // No template yet
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                // Determine overall directory status
-                let status = if modified_count > 0 {
-                    "●"
-                } else if missing_count > 0 {
-                    "✗"
-                } else {
-                    "✓"
-                };
-                
-                // Build status string
-                let mut status_parts = vec![format!("1 directory, {} files", file_count)];
-                
-                if unchanged_count > 0 {
-                    let percent = (unchanged_count * 100) / file_count;
-                    status_parts.push(format!("✓ {}% ok ({}/{})", percent, unchanged_count, file_count));
-                }
-                
-                if modified_count > 0 {
-                    let percent = (modified_count * 100) / file_count;
-                    status_parts.push(format!("● {}% modified ({}/{})", percent, modified_count, file_count));
-                }
-                
-                if missing_count > 0 {
-                    let percent = (missing_count * 100) / file_count;
-                    status_parts.push(format!("✗ {}% missing ({}/{})", percent, missing_count, file_count));
-                }
-                
-                if new_count > 0 {
-                    let percent = (new_count * 100) / file_count;
-                    status_parts.push(format!("? {}% new ({}/{})", percent, new_count, file_count));
-                }
-                
-                println!("    {} {} ({})", status, dir_path.display(), status_parts.join(", "));
-            } else {
-                // Directory doesn't exist
-                println!("    ✗ {} (directory missing)", dir_path.display());
-            }
-            
-            if detailed {
-                // Show individual files when in detailed mode
-                if dir_path.exists() && dir_path.is_dir() {
-                    if let Ok(entries) = std::fs::read_dir(dir_path) {
-                        let mut files: Vec<_> = entries.flatten()
-                            .filter_map(|e| {
-                                let metadata = e.metadata().ok()?;
-                                if metadata.is_file() {
-                                    Some(e.path())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        files.sort();
-                        
-                        for file_path in files {
-                            // Check if template exists for this file
-                            let template_path = enrollment_manager.get_group_template_path(group_name, &file_path)?;
-                            
-                            let file_status = if template_path.exists() {
-                                // Template exists, check if file matches
-                                if let Ok(template_content) = std::fs::read_to_string(&template_path) {
-                                    if let Ok(file_content) = std::fs::read_to_string(&file_path) {
-                                        // Process template to compare
-                                        if let Ok(processed) = crate::template::process_handlebars(&template_content, &hostname) {
-                                            if processed == file_content {
-                                                "✓"
-                                            } else {
-                                                "●"
+                                                "?"
                                             }
                                         } else {
                                             "?"
@@ -501,25 +506,71 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                                         "?"
                                     }
                                 } else {
+                                    "?"  // No template yet
+                                };
+                                
+                                let relative_path = file_path.strip_prefix(dir_path)
+                                    .unwrap_or(&file_path);
+                                println!("      {} {}", file_status, relative_path.display());
+                            }
+                        }
+                    }
+                    
+                    if let Some(last_synced) = &entry.last_synced {
+                        println!("      Last synced: {}", last_synced.format("%Y-%m-%d %H:%M:%S"));
+                    }
+                    println!("      Enrolled: {}", entry.enrolled_at.format("%Y-%m-%d %H:%M:%S"));
+                    if entry.is_hybrid == Some(true) {
+                        println!("      Mode: hybrid");
+                    }
+                }
+            } else {
+                // Handle individual file enrollment
+                let file_path = path;
+                let status = if file_path.exists() {
+                    // Check if file matches template
+                    if let Some(template_path) = &entry.template_path {
+                        if template_path.exists() {
+                            if let Ok(template_content) = std::fs::read_to_string(template_path) {
+                                if let Ok(file_content) = std::fs::read_to_string(file_path) {
+                                    if let Ok(processed) = crate::template::process_handlebars(&template_content, &hostname) {
+                                        if processed == file_content {
+                                            "✓"
+                                        } else {
+                                            "●"
+                                        }
+                                    } else {
+                                        "?"
+                                    }
+                                } else {
                                     "?"
                                 }
                             } else {
-                                "?"  // No template yet
-                            };
-                            
-                            let relative_path = file_path.strip_prefix(dir_path)
-                                .unwrap_or(&file_path);
-                            println!("      {} {}", file_status, relative_path.display());
+                                "?"
+                            }
+                        } else {
+                            "✗" // Template missing
                         }
+                    } else {
+                        "?" // No template path
                     }
-                }
+                } else {
+                    "✗" // File missing
+                };
                 
-                if let Some(last_synced) = &entry.last_synced {
-                    println!("      Last synced: {}", last_synced.format("%Y-%m-%d %H:%M:%S"));
-                }
-                println!("      Enrolled: {}", entry.enrolled_at.format("%Y-%m-%d %H:%M:%S"));
-                if entry.is_hybrid == Some(true) {
-                    println!("      Mode: hybrid");
+                println!("    {} {}", status, file_path.display());
+                
+                if detailed {
+                    if let Some(last_synced) = &entry.last_synced {
+                        println!("      Last synced: {}", last_synced.format("%Y-%m-%d %H:%M:%S"));
+                    }
+                    if let Some(template_path) = &entry.template_path {
+                        println!("      Template: {}", template_path.display());
+                    }
+                    println!("      Enrolled: {}", entry.enrolled_at.format("%Y-%m-%d %H:%M:%S"));
+                    if entry.is_hybrid == Some(true) {
+                        println!("      Mode: hybrid");
+                    }
                 }
             }
         }
@@ -1038,18 +1089,23 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
         return Ok(());
     }
     
-    // Collect all enrolled directories to watch from manifests
-    let mut watch_dirs = HashSet::new();
-    let mut dir_to_group_map = std::collections::HashMap::new();
+    // Collect all enrolled paths to watch from manifests
+    let mut watch_paths = HashSet::new();
+    let mut path_to_group_map = std::collections::HashMap::new();
+    let mut enrolled_directories = HashSet::new();
+    let mut enrolled_files = HashSet::new();
     
     for group_name in &groups_to_watch {
         // Load both group and machine manifests
         if let Ok(group_manifest) = enrollment_manager.load_group_manifest(group_name) {
             for (path, entry) in &group_manifest.entries {
-                // Only watch directories, not individual files
+                watch_paths.insert(path.clone());
+                path_to_group_map.insert(path.clone(), group_name.clone());
+                
                 if entry.checksum == "directory" {
-                    watch_dirs.insert(path.clone());
-                    dir_to_group_map.insert(path.clone(), group_name.clone());
+                    enrolled_directories.insert(path.clone());
+                } else {
+                    enrolled_files.insert(path.clone());
                 }
             }
         }
@@ -1057,21 +1113,25 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
         let machine_manifest = enrollment_manager.load_manifest()?;
         for (path, entry) in &machine_manifest.entries {
             if &entry.group == group_name {
-                // Only watch directories, not individual files
+                watch_paths.insert(path.clone());
+                path_to_group_map.insert(path.clone(), group_name.clone());
+                
                 if entry.checksum == "directory" {
-                    watch_dirs.insert(path.clone());
-                    dir_to_group_map.insert(path.clone(), group_name.clone());
+                    enrolled_directories.insert(path.clone());
+                } else {
+                    enrolled_files.insert(path.clone());
                 }
             }
         }
     }
     
-    if watch_dirs.is_empty() {
-        println!("No enrolled directories found in the specified group(s).");
+    if watch_paths.is_empty() {
+        println!("No enrolled paths found in the specified group(s).");
         return Ok(());
     }
     
-    println!("Watching {} directories across {} group(s):", watch_dirs.len(), groups_to_watch.len());
+    println!("Watching {} paths ({} directories, {} files) across {} group(s):", 
+        watch_paths.len(), enrolled_directories.len(), enrolled_files.len(), groups_to_watch.len());
     for group in &groups_to_watch {
         println!("  • {}", group);
     }
@@ -1087,10 +1147,11 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
         }
     })?;
     
-    // Watch enrolled directories
+    // Watch enrolled paths
     let mut watched_count = 0;
     
-    for dir in &watch_dirs {
+    // Watch directories recursively
+    for dir in &enrolled_directories {
         if dir.exists() {
             if let Err(e) = watcher.watch(dir, RecursiveMode::Recursive) {
                 warn!("Failed to watch directory {:?}: {}", dir, e);
@@ -1100,6 +1161,26 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
             }
         } else {
             warn!("Enrolled directory does not exist: {:?}", dir);
+        }
+    }
+    
+    // Watch individual files (and their parent directories non-recursively)
+    let mut watched_file_dirs = HashSet::new();
+    for file in &enrolled_files {
+        if let Some(parent) = file.parent() {
+            if !watched_file_dirs.contains(parent) && parent.exists() {
+                if let Err(e) = watcher.watch(parent, RecursiveMode::NonRecursive) {
+                    warn!("Failed to watch parent directory {:?}: {}", parent, e);
+                } else {
+                    watched_file_dirs.insert(parent.to_path_buf());
+                    debug!("Watching parent directory {:?} for file {:?}", parent, file);
+                }
+            }
+        }
+        if file.exists() {
+            watched_count += 1;
+        } else {
+            warn!("Enrolled file does not exist: {:?}", file);
         }
     }
     
@@ -1124,28 +1205,43 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
         println!("\nScanning enrolled directories for missing files...");
         let mut missing_files = Vec::new();
         
-        // For each enrolled directory, scan templates and check if files exist
-        for (dir, group) in &dir_to_group_map {
-            let group_dir = crate::fs::get_group_dir(&config.mfs_mount, "", group);
-            
-            // Scan templates in this group directory
-            if let Ok(walker) = walkdir::WalkDir::new(&group_dir).into_iter() {
-                for entry in walker.filter_map(|e| e.ok()) {
-                    if entry.file_type().is_file() && 
-                       entry.path().extension() == Some(std::ffi::OsStr::new("lasz")) {
-                        
-                        // Extract the original file path from template path
-                        if let Ok(relative_path) = entry.path().strip_prefix(&group_dir) {
-                            let path_str = relative_path.to_string_lossy();
-                            if path_str.ends_with(".lasz") {
-                                let original_path = PathBuf::from("/").join(&path_str[..path_str.len() - 5]);
-                                
-                                // Check if this file is within our enrolled directory
-                                if original_path.starts_with(dir) && !original_path.exists() {
-                                    missing_files.push((original_path, group.clone(), entry.path().to_path_buf()));
+        // For enrolled directories, scan templates and check if files exist
+        for dir in &enrolled_directories {
+            if let Some(group) = path_to_group_map.get(dir) {
+                let group_dir = crate::fs::get_group_dir(&config.mfs_mount, "", group);
+                
+                // Scan templates in this group directory
+                for entry in walkdir::WalkDir::new(&group_dir).into_iter().filter_map(|e| e.ok()) {
+                        if entry.file_type().is_file() && 
+                           entry.path().extension() == Some(std::ffi::OsStr::new("lasz")) {
+                            
+                            // Extract the original file path from template path
+                            if let Ok(relative_path) = entry.path().strip_prefix(&group_dir) {
+                                let path_str = relative_path.to_string_lossy();
+                                if path_str.ends_with(".lasz") {
+                                    // The relative path is like "tmp/test/file.txt.lasz", we need "/tmp/test/file.txt"
+                                    let original_path = PathBuf::from("/").join(&path_str[..path_str.len() - 5]);
+                                    
+                                    debug!("Checking template: {:?} -> original path: {:?}", entry.path(), original_path);
+                                    
+                                    // Check if this file is within our enrolled directory
+                                    if original_path.starts_with(dir) && !original_path.exists() {
+                                        missing_files.push((original_path, group.clone(), entry.path().to_path_buf()));
+                                    }
                                 }
                             }
                         }
+                    }
+            }
+        }
+        
+        // For enrolled files, check if they exist
+        for file in &enrolled_files {
+            if !file.exists() {
+                if let Some(group) = path_to_group_map.get(file) {
+                    let template_path = enrollment_manager.get_group_template_path(group, file)?;
+                    if template_path.exists() {
+                        missing_files.push((file.clone(), group.clone(), template_path));
                     }
                 }
             }
@@ -1198,15 +1294,26 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                                 template_changes.insert(path);
                                 last_template_time = std::time::Instant::now();
                             }
-                            // Check if it's a file in a watched directory
+                            // Check if it's a file we should track
                             else if path.is_file() {
-                                // Find which watched directory contains this file
-                                for (dir, _group) in &dir_to_group_map {
-                                    if path.starts_with(dir) {
-                                        debounce_buffer.insert(path);
-                                        last_event_time = std::time::Instant::now();
-                                        break;
+                                let mut should_track = false;
+                                
+                                // Check if it's an enrolled file
+                                if enrolled_files.contains(&path) {
+                                    should_track = true;
+                                } else {
+                                    // Check if it's within an enrolled directory
+                                    for dir in &enrolled_directories {
+                                        if path.starts_with(dir) {
+                                            should_track = true;
+                                            break;
+                                        }
                                     }
+                                }
+                                
+                                if should_track {
+                                    debounce_buffer.insert(path);
+                                    last_event_time = std::time::Instant::now();
                                 }
                             }
                         }
@@ -1230,27 +1337,43 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                     
                     for path in &debounce_buffer {
                         // Find which group this file belongs to
-                        for (dir, group) in &dir_to_group_map {
-                            if path.starts_with(dir) {
-                                affected_groups.insert(group.clone());
-                                files_by_group.entry(group.clone())
-                                    .or_insert_with(Vec::new)
-                                    .push(path.clone());
-                                
-                                let status_char = if path.exists() {
-                                    // Check if template exists
-                                    let template_path = enrollment_manager.get_group_template_path(group, path)?;
-                                    if template_path.exists() {
-                                        "●"  // Modified
-                                    } else {
-                                        "?"  // New file
-                                    }
-                                } else {
-                                    "✗"  // Deleted
-                                };
-                                println!("  {} {} (group: {})", status_char, path.display(), group);
-                                break;
+                        let mut found_group = None;
+                        
+                        // Check if this is an enrolled file
+                        if enrolled_files.contains(path) {
+                            if let Some(group) = path_to_group_map.get(path) {
+                                found_group = Some(group.clone());
                             }
+                        } else {
+                            // Check if it's within an enrolled directory
+                            for dir in &enrolled_directories {
+                                if path.starts_with(dir) {
+                                    if let Some(group) = path_to_group_map.get(dir) {
+                                        found_group = Some(group.clone());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if let Some(group) = found_group {
+                            affected_groups.insert(group.clone());
+                            files_by_group.entry(group.clone())
+                                .or_insert_with(Vec::new)
+                                .push(path.clone());
+                            
+                            let status_char = if path.exists() {
+                                // Check if template exists
+                                let template_path = enrollment_manager.get_group_template_path(&group, path)?;
+                                if template_path.exists() {
+                                    "●"  // Modified
+                                } else {
+                                    "?"  // New file
+                                }
+                            } else {
+                                "✗"  // Deleted
+                            };
+                            println!("  {} {} (group: {})", status_char, path.display(), group);
                         }
                     }
                     
