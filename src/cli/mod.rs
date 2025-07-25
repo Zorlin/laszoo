@@ -42,6 +42,13 @@ pub enum Commands {
         include_hidden: bool,
     },
     
+    /// Unenroll files from Laszoo management
+    Unenroll {
+        /// Paths to files to unenroll
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+    
     /// Synchronize configuration files
     Sync {
         /// Specific group to sync (all groups if not specified)

@@ -155,5 +155,11 @@ pub fn get_group_template_path(mfs_mount: &Path, _laszoo_dir: &str, group_name: 
         file_path
     };
     
-    Ok(group_dir.join(relative_path).with_extension("lasz"))
+    // Append .lasz extension instead of replacing existing extension
+    let mut template_path = group_dir.join(relative_path);
+    let current_name = template_path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    template_path.set_file_name(format!("{}.lasz", current_name));
+    Ok(template_path)
 }

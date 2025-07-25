@@ -41,6 +41,11 @@ impl EnrollmentManifest {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        
         let json = serde_json::to_string_pretty(self)?;
         fs::write(path, json)?;
         Ok(())
@@ -235,7 +240,14 @@ impl EnrollmentManager {
                 // Extract the original file path from the template path
                 let relative_path = template_path.strip_prefix(&group_dir)
                     .map_err(|_| LaszooError::Other("Invalid template path structure".to_string()))?;
-                let original_path = PathBuf::from("/").join(relative_path.with_extension(""));
+                
+                // Remove only the .lasz extension, keeping any original extension
+                let path_str = relative_path.to_string_lossy();
+                let original_path = if path_str.ends_with(".lasz") {
+                    PathBuf::from("/").join(&path_str[..path_str.len() - 5])
+                } else {
+                    PathBuf::from("/").join(relative_path)
+                };
                 
                 // Apply the template
                 self.apply_template(group, template_path, &original_path)?;

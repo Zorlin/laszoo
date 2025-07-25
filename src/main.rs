@@ -49,6 +49,9 @@ async fn run() -> Result<()> {
         Commands::Enroll { group, paths, force, include_hidden } => {
             enroll_files(&config, &group, paths, force, include_hidden).await?;
         }
+        Commands::Unenroll { paths } => {
+            unenroll_files(&config, paths).await?;
+        }
         Commands::Sync { group, strategy } => {
             sync_files(&config, group.as_deref(), &strategy, cli.dry_run).await?;
         }
@@ -121,6 +124,46 @@ async fn init_laszoo(config: &Config, mfs_mount: &std::path::Path) -> Result<()>
     info!("Laszoo initialized successfully!");
     
     Ok(())
+}
+
+async fn unenroll_files(config: &Config, paths: Vec<PathBuf>) -> Result<()> {
+    use crate::enrollment::EnrollmentManager;
+    
+    // Ensure distributed filesystem is available
+    crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
+    
+    // Create enrollment manager
+    let manager = EnrollmentManager::new(
+        config.mfs_mount.clone(),
+        "".to_string()
+    );
+    
+    let mut unenrolled_count = 0;
+    let mut error_count = 0;
+    
+    for path in paths {
+        match manager.unenroll_file(&path) {
+            Ok(_) => {
+                info!("Unenrolled: {:?}", path);
+                unenrolled_count += 1;
+            }
+            Err(e) => {
+                error!("Failed to unenroll {:?}: {}", path, e);
+                error_count += 1;
+            }
+        }
+    }
+    
+    info!("Unenrollment complete: {} files unenrolled, {} errors", 
+          unenrolled_count, error_count);
+    
+    if error_count > 0 {
+        Err(LaszooError::Other(
+            format!("Unenrollment completed with {} errors", error_count)
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 async fn enroll_files(
