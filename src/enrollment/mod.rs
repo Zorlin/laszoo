@@ -603,32 +603,52 @@ impl EnrollmentManager {
         // Copy metadata from template
         self.copy_metadata(template_path, target_path)?;
         
-        // Update manifest
-        let mut manifest = self.load_manifest()?;
-        let checksum = self.calculate_checksum(target_path)?;
+        // Check if this file should be adopted into an enrolled directory instead of creating individual entry
+        let abs_path = target_path.canonicalize().unwrap_or_else(|_| target_path.to_path_buf());
+        let mut should_create_entry = true;
         
-        // Check group manifest to see if this file has enrolled_directory info
-        let enrolled_directory = if let Ok(group_manifest) = self.load_group_manifest(group) {
-            group_manifest.is_enrolled(target_path)
-                .and_then(|e| e.enrolled_directory.as_ref())
-                .map(|p| p.to_path_buf())
-        } else {
-            None
-        };
+        // Check group manifest for enrolled directories
+        if let Ok(group_manifest) = self.load_group_manifest(group) {
+            for (enrolled_path, entry) in &group_manifest.entries {
+                if entry.checksum == "directory" {
+                    // Check if our file is within this directory
+                    if abs_path.starts_with(enrolled_path) {
+                        info!("File {:?} is within enrolled directory {:?}, not creating individual manifest entry", abs_path, enrolled_path);
+                        should_create_entry = false;
+                        break;
+                    }
+                }
+            }
+        }
         
-        let entry = EnrollmentEntry {
-            original_path: target_path.to_path_buf(),
-            checksum,
-            group: group.to_string(),
-            enrolled_at: chrono::Utc::now(),
-            last_synced: Some(chrono::Utc::now()),
-            template_path: Some(template_path.to_path_buf()),
-            is_hybrid: if is_hybrid { Some(true) } else { None },
-            enrolled_directory,
-        };
-        
-        manifest.add_entry(entry);
-        self.save_manifest(&manifest)?;
+        // Only create manifest entry if file is not within an enrolled directory
+        if should_create_entry {
+            let mut manifest = self.load_manifest()?;
+            let checksum = self.calculate_checksum(target_path)?;
+            
+            // Check group manifest to see if this file has enrolled_directory info
+            let enrolled_directory = if let Ok(group_manifest) = self.load_group_manifest(group) {
+                group_manifest.is_enrolled(target_path)
+                    .and_then(|e| e.enrolled_directory.as_ref())
+                    .map(|p| p.to_path_buf())
+            } else {
+                None
+            };
+            
+            let entry = EnrollmentEntry {
+                original_path: target_path.to_path_buf(),
+                checksum,
+                group: group.to_string(),
+                enrolled_at: chrono::Utc::now(),
+                last_synced: Some(chrono::Utc::now()),
+                template_path: Some(template_path.to_path_buf()),
+                is_hybrid: if is_hybrid { Some(true) } else { None },
+                enrolled_directory,
+            };
+            
+            manifest.add_entry(entry);
+            self.save_manifest(&manifest)?;
+        }
         
         Ok(())
     }

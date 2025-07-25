@@ -1051,6 +1051,15 @@ fn update_group_symlinks(mfs_mount: &Path, machine_name: &str, groups: &[String]
     Ok(())
 }
 
+/// Calculate checksum of a file
+fn calculate_file_checksum(path: &Path) -> Result<String> {
+    use sha2::{Sha256, Digest};
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 // Helper function to list machines in a group
 fn list_machines_in_group(mfs_mount: &Path, group_name: &str) -> Result<Vec<String>> {
     let machines_dir = mfs_mount.join("machines");
@@ -1191,6 +1200,9 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
     // Create a channel for file events
     let (tx, rx) = channel();
     
+    // Create a channel for completed commits
+    let (commit_tx, commit_rx) = std::sync::mpsc::channel::<HashSet<PathBuf>>();
+    
     // Create a debounced watcher
     let mut watcher = notify::recommended_watcher(move |event: std::result::Result<Event, notify::Error>| {
         if let Ok(event) = event {
@@ -1309,17 +1321,33 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                 
                 // For converge with --hard, delete the template
                 if matches!(sync_action, SyncAction::Converge) {
-                    std::fs::remove_file(template_path)?;
-                    println!("    → Deleted template for missing file");
+                    if let Err(e) = std::fs::remove_file(template_path) {
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            println!("    → Template already deleted");
+                        } else {
+                            return Err(LaszooError::Io(e));
+                        }
+                    } else {
+                        println!("    → Deleted template for missing file");
+                    }
                 }
             }
             
             // Commit template deletions if any were made
             if config.auto_commit && !missing_files.is_empty() {
-                println!("\nAuto-committing template deletions...");
-                if let Err(e) = commit_changes(config, Some("Removed templates for missing files"), true).await {
-                    error!("Failed to auto-commit: {}", e);
-                }
+                println!("\nScheduling background commit for template deletions...");
+                
+                // Clone config for background task
+                let config_clone = config.clone();
+                
+                // Spawn background commit task
+                tokio::spawn(async move {
+                    if let Err(e) = commit_changes(&config_clone, Some("Removed templates for missing files"), true).await {
+                        error!("Failed to auto-commit template deletions: {}", e);
+                    } else {
+                        println!("✓ Template deletion commit completed");
+                    }
+                });
             }
         }
     }
@@ -1329,14 +1357,17 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
     let mut template_changes = HashSet::new();
     let mut local_file_changes = HashSet::new(); // Track local file changes
     let mut local_template_changes = HashSet::new(); // Track template changes that originated locally
+    let mut committed_template_changes = HashSet::new(); // Track template changes that have been committed
     let mut ignore_file_changes = HashSet::new(); // Track files we're currently applying templates to (ignore subsequent changes)
+    let mut ignore_file_timestamps: HashMap<PathBuf, std::time::Instant> = HashMap::new(); // Track when files were added to ignore list
     let debounce_duration = Duration::from_millis(500);
     let mut last_event_time = std::time::Instant::now();
     let mut last_template_time = std::time::Instant::now();
     let mut last_template_scan = std::time::Instant::now();
-    let template_scan_interval = Duration::from_secs(10); // Scan every 10 seconds
+    let template_scan_interval = Duration::from_secs(2); // Scan every 2 seconds
     let mut known_templates: HashSet<PathBuf> = HashSet::new();
     let mut known_template_timestamps: std::collections::HashMap<PathBuf, std::time::SystemTime> = std::collections::HashMap::new();
+    let mut known_template_checksums: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
     
     // Initial scan of templates
     for group_name in &groups_to_watch {
@@ -1347,11 +1378,16 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                     let template_path = entry.path().to_path_buf();
                     known_templates.insert(template_path.clone());
                     
-                    // Record initial timestamp
+                    // Record initial timestamp and checksum
                     if let Ok(metadata) = std::fs::metadata(&template_path) {
                         if let Ok(modified) = metadata.modified() {
-                            known_template_timestamps.insert(template_path, modified);
+                            known_template_timestamps.insert(template_path.clone(), modified);
                         }
+                    }
+                    
+                    // Calculate initial checksum
+                    if let Ok(checksum) = calculate_file_checksum(&template_path) {
+                        known_template_checksums.insert(template_path, checksum);
                     }
                 }
             }
@@ -1359,6 +1395,21 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
     }
     
     loop {
+        // Check for completed commits (non-blocking)
+        while let Ok(completed_changes) = commit_rx.try_recv() {
+            if completed_changes.is_empty() {
+                // Commit failed, remove from committed_template_changes to allow retry
+                debug!("Commit failed, will retry on next cycle");
+            } else {
+                // Successfully committed, can now remove from local_template_changes
+                for change in &completed_changes {
+                    local_template_changes.remove(change);
+                    committed_template_changes.remove(change);
+                }
+                debug!("Cleaned up {} committed template changes", completed_changes.len());
+            }
+        }
+        
         // Check for events with timeout
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(event) => {
@@ -1372,8 +1423,8 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                                 template_changes.insert(path);
                                 last_template_time = std::time::Instant::now();
                             }
-                            // Check if it's a file we should track
-                            else if path.is_file() {
+                            // Check if it's a file we should track (including deleted files)
+                            else {
                                 let mut should_track = false;
                                 
                                 // Check if it's an enrolled file
@@ -1389,10 +1440,15 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                                     }
                                 }
                                 
-                                if should_track && !ignore_file_changes.contains(&path) {
-                                    debounce_buffer.insert(path.clone());
-                                    local_file_changes.insert(path); // Track this as a local change
-                                    last_event_time = std::time::Instant::now();
+                                if should_track {
+                                    if ignore_file_changes.contains(&path) {
+                                        debug!("Ignoring file change event for {:?} (template application in progress)", path);
+                                    } else {
+                                        debounce_buffer.insert(path.clone());
+                                        local_file_changes.insert(path.clone()); // Track this as a local change
+                                        last_event_time = std::time::Instant::now();
+                                        debug!("Tracking file change for {:?}", path);
+                                    }
                                 }
                             }
                         }
@@ -1415,6 +1471,12 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                     let mut files_by_group: HashMap<String, Vec<PathBuf>> = HashMap::new();
                     
                     for path in &debounce_buffer {
+                        // Skip files that are currently being ignored (template applications)
+                        if ignore_file_changes.contains(path) {
+                            debug!("Skipping file change for {:?} (currently applying template)", path);
+                            continue;
+                        }
+                        
                         // Find which group this file belongs to
                         let mut found_group = None;
                         
@@ -1520,29 +1582,47 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                     
                     debug!("Template changes detected: {} files", template_changes.len());
                     
-                    // Apply new templates automatically
-                    println!("\n[{}] Template changes detected, applying...", 
-                        chrono::Local::now().format("%H:%M:%S"));
-                    
-                    for group_name in &groups_to_watch {
-                        if let Err(e) = enrollment_manager.apply_group_templates(group_name) {
-                            error!("Failed to apply templates for group '{}': {}", group_name, e);
-                        } else {
-                            debug!("Applied templates for group '{}'", group_name);
-                        }
-                    }
-                    
                     // Only auto-commit template changes that originated from local file changes
                     if config.auto_commit && !local_template_changes.is_empty() {
-                        println!("Auto-committing {} local template changes...", local_template_changes.len());
-                        if let Err(e) = commit_changes(config, Some("Template changes from local file modifications"), true).await {
-                            error!("Failed to auto-commit template changes: {}", e);
+                        println!("\nScheduling background commit for {} local template changes...", local_template_changes.len());
+                        
+                        // Clone the changes being committed (excluding already committed ones)
+                        let mut changes_to_commit = HashSet::new();
+                        for change in &local_template_changes {
+                            if !committed_template_changes.contains(change) {
+                                changes_to_commit.insert(change.clone());
+                            }
+                        }
+                        
+                        if !changes_to_commit.is_empty() {
+                            // Mark these as being committed
+                            for change in &changes_to_commit {
+                                committed_template_changes.insert(change.clone());
+                            }
+                            
+                            // Clone config and channel for background task
+                            let config_clone = config.clone();
+                            let commit_tx_clone = commit_tx.clone();
+                            let changes_clone = changes_to_commit.clone();
+                            
+                            // Spawn background commit task
+                            tokio::spawn(async move {
+                                if let Err(e) = commit_changes(&config_clone, Some("Template changes from local file modifications"), true).await {
+                                    error!("Failed to auto-commit template changes: {}", e);
+                                    // Send back empty set to indicate failure
+                                    let _ = commit_tx_clone.send(HashSet::new());
+                                } else {
+                                    println!("✓ Background commit completed for {} template changes", changes_clone.len());
+                                    // Send back the committed changes
+                                    let _ = commit_tx_clone.send(changes_clone);
+                                }
+                            });
                         }
                     }
                     
-                    // Clear the buffers
+                    // Clear template_changes but keep local_template_changes for race condition handling
                     template_changes.clear();
-                    local_template_changes.clear();
+                    // Don't clear local_template_changes - they'll be cleaned up when commits complete
                 }
                 
                 // Periodic template scanning for MooseFS (since inotify doesn't work)
@@ -1562,19 +1642,33 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                                     let mut is_modified = false;
                                     
                                     if !is_new {
-                                        // Check if timestamp changed
+                                        // Check if content changed (using checksum)
+                                        if let Ok(current_checksum) = calculate_file_checksum(&template_path) {
+                                            if let Some(known_checksum) = known_template_checksums.get(&template_path) {
+                                                if &current_checksum != known_checksum {
+                                                    is_modified = true;
+                                                    known_template_checksums.insert(template_path.clone(), current_checksum);
+                                                    debug!("Template checksum changed for {:?}", template_path);
+                                                }
+                                            } else {
+                                                // No known checksum, treat as modified
+                                                is_modified = true;
+                                                known_template_checksums.insert(template_path.clone(), current_checksum);
+                                            }
+                                        }
+                                        
+                                        // Also update timestamp for reference
                                         if let Ok(metadata) = std::fs::metadata(&template_path) {
                                             if let Ok(modified) = metadata.modified() {
-                                                if let Some(known_time) = known_template_timestamps.get(&template_path) {
-                                                    if modified != *known_time {
-                                                        is_modified = true;
-                                                        known_template_timestamps.insert(template_path.clone(), modified);
-                                                    }
-                                                }
+                                                known_template_timestamps.insert(template_path.clone(), modified);
                                             }
                                         }
                                     } else {
-                                        // New template - record its timestamp
+                                        // New template - record its checksum and timestamp
+                                        if let Ok(checksum) = calculate_file_checksum(&template_path) {
+                                            known_template_checksums.insert(template_path.clone(), checksum);
+                                        }
+                                        
                                         if let Ok(metadata) = std::fs::metadata(&template_path) {
                                             if let Ok(modified) = metadata.modified() {
                                                 known_template_timestamps.insert(template_path.clone(), modified);
@@ -1612,6 +1706,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                                                     
                                                     // Add to ignore list before applying
                                                     ignore_file_changes.insert(original_path.clone());
+                                                    ignore_file_timestamps.insert(original_path.clone(), std::time::Instant::now());
                                                     
                                                     // Apply this specific template
                                                     if let Err(e) = enrollment_manager.apply_single_template(&template_path, &original_path) {
@@ -1640,8 +1735,22 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                     // This prevents false positives where we think a template change was local
                     local_file_changes.clear();
                     
-                    // Also clear ignore list to allow monitoring files again
-                    ignore_file_changes.clear();
+                    // Clean up expired ignore entries (older than 5 seconds)
+                    let ignore_timeout = Duration::from_secs(5);
+                    let now = std::time::Instant::now();
+                    let mut expired_ignores = Vec::new();
+                    
+                    for (path, timestamp) in &ignore_file_timestamps {
+                        if now.duration_since(*timestamp) > ignore_timeout {
+                            expired_ignores.push(path.clone());
+                        }
+                    }
+                    
+                    for path in expired_ignores {
+                        ignore_file_changes.remove(&path);
+                        ignore_file_timestamps.remove(&path);
+                        debug!("Expired ignore for file: {:?}", path);
+                    }
                     
                     last_template_scan = std::time::Instant::now();
                 }
