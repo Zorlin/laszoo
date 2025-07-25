@@ -675,6 +675,7 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                         println!("      Mode: hybrid");
                     }
                 }
+                }
             }
             debug!("Finished processing entry: {}", path.display());
         }
