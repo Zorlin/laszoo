@@ -12,6 +12,13 @@ pub struct TemplateEngine {
 }
 
 impl TemplateEngine {
+    /// Merge file changes back to template while preserving variables
+    pub fn merge_file_changes_to_template(&self, template_content: &str, file_content: &str) -> Result<String> {
+        // For now, just return the file content as the new template
+        // TODO: Implement intelligent merging that preserves {{ variables }} and [[x quack x]] tags
+        Ok(file_content.to_string())
+    }
+
     pub fn new() -> Result<Self> {
         let mut handlebars = Handlebars::new();
         handlebars.set_strict_mode(false);

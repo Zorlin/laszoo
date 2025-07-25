@@ -278,11 +278,96 @@ impl EnrollmentManager {
         
         let abs_path = dir_path.canonicalize()?;
         
+        // Just enroll the directory itself, not individual files
+        // The filesystem is the source of truth for directory contents
+        
+        if machine_specific {
+            // Create machine-specific directory entry
+            let mut machine_manifest = self.load_manifest()?;
+            
+            // Check if already enrolled
+            if let Some(existing) = machine_manifest.is_enrolled(&abs_path) {
+                if !force {
+                    return Err(LaszooError::AlreadyEnrolled {
+                        path: abs_path.clone(),
+                        group: existing.group.clone(),
+                    });
+                }
+                info!("Force enrolling directory in machine manifest");
+            }
+            
+            let machine_entry = EnrollmentEntry {
+                original_path: abs_path.clone(),
+                checksum: "directory".to_string(),  // Special marker for directories
+                group: group.to_string(),
+                enrolled_at: chrono::Utc::now(),
+                last_synced: None,
+                template_path: None,  // Directories don't have templates
+                is_hybrid: if hybrid { Some(true) } else { None },
+                enrolled_directory: Some(abs_path.clone()),  // Mark this as an enrolled directory
+            };
+            
+            machine_manifest.add_entry(machine_entry);
+            self.save_manifest(&machine_manifest)?;
+            
+            info!("Successfully enrolled directory {:?} as machine-specific for group '{}'", abs_path, group);
+        } else {
+            // Create group directory entry
+            let mut group_manifest = self.load_group_manifest(group)?;
+            
+            // Check if already enrolled in group manifest
+            if let Some(existing) = group_manifest.is_enrolled(&abs_path) {
+                if !force {
+                    return Err(LaszooError::AlreadyEnrolled {
+                        path: abs_path.clone(),
+                        group: existing.group.clone(),
+                    });
+                }
+                info!("Force enrolling directory in group manifest");
+            }
+            
+            let group_entry = EnrollmentEntry {
+                original_path: abs_path.clone(),
+                checksum: "directory".to_string(),  // Special marker for directories
+                group: group.to_string(),
+                enrolled_at: chrono::Utc::now(),
+                last_synced: None,
+                template_path: None,  // Directories don't have templates
+                is_hybrid: None,
+                enrolled_directory: Some(abs_path.clone()),  // Mark this as an enrolled directory
+            };
+            
+            group_manifest.add_entry(group_entry);
+            self.save_group_manifest(group, &group_manifest)?;
+            
+            info!("Successfully enrolled directory {:?} into group '{}'", abs_path, group);
+        }
+        
+        // Now copy all existing files in the directory to templates
         for entry in walkdir::WalkDir::new(&abs_path) {
             let entry = entry?;
             if entry.file_type().is_file() {
-                if let Err(e) = self.enroll_file_with_dir(entry.path(), group, force, machine_specific, hybrid, Some(&abs_path)) {
-                    warn!("Failed to enroll {:?}: {}", entry.path(), e);
+                // Create template for this file
+                let file_path = entry.path();
+                let content = fs::read_to_string(file_path)?;
+                
+                let group_template_path = crate::fs::get_group_template_path(
+                    &self.mfs_mount, 
+                    "", 
+                    group,
+                    file_path
+                )?;
+                
+                // Ensure parent directory exists
+                if let Some(parent) = group_template_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                
+                // Create template if it doesn't exist
+                if !group_template_path.exists() {
+                    fs::write(&group_template_path, &content)?;
+                    self.copy_metadata(file_path, &group_template_path)?;
+                    debug!("Created template for directory file: {:?}", group_template_path);
                 }
             }
         }
@@ -345,6 +430,46 @@ impl EnrollmentManager {
             fs::write(&groups_file, groups.join("\n") + "\n")?;
             info!("Added machine '{}' to group '{}'", self.hostname, group);
         }
+        
+        Ok(())
+    }
+
+    /// Get the group template path for a file
+    pub fn get_group_template_path(&self, group: &str, file_path: &Path) -> Result<PathBuf> {
+        let group_dir = crate::fs::get_group_dir(&self.mfs_mount, "", group);
+        let relative_path = if file_path.is_absolute() {
+            file_path.strip_prefix("/").unwrap_or(file_path)
+        } else {
+            file_path
+        };
+        
+        let mut template_path = group_dir.join(relative_path);
+        let current_name = template_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        template_path.set_file_name(format!("{}.lasz", current_name));
+        
+        Ok(template_path)
+    }
+    
+    /// Apply a single template file to its target location
+    pub fn apply_single_template(&self, template_path: &Path, target_path: &Path) -> Result<()> {
+        // Read template content
+        let template_content = std::fs::read_to_string(template_path)?;
+        
+        // Process the template
+        let final_content = crate::template::process_handlebars(&template_content, &self.hostname)?;
+        
+        // Create parent directory if needed
+        if let Some(parent) = target_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        
+        // Write the processed content
+        std::fs::write(target_path, &final_content)?;
+        
+        // Copy metadata from template
+        self.copy_metadata(template_path, target_path)?;
         
         Ok(())
     }

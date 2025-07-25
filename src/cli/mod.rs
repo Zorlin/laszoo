@@ -156,6 +156,10 @@ pub enum Commands {
         /// Apply changes automatically without prompting
         #[arg(short, long)]
         auto: bool,
+        
+        /// Propagate deletions (delete local files if templates are deleted, delete templates if local files are deleted)
+        #[arg(long)]
+        hard: bool,
     },
 }
 
