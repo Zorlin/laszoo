@@ -61,25 +61,23 @@ impl EnrollmentManifest {
 
 pub struct EnrollmentManager {
     mfs_mount: PathBuf,
-    laszoo_dir: String,
     hostname: String,
 }
 
 impl EnrollmentManager {
-    pub fn new(mfs_mount: PathBuf, laszoo_dir: String) -> Self {
+    pub fn new(mfs_mount: PathBuf, _laszoo_dir: String) -> Self {
         let hostname = gethostname::gethostname()
             .to_string_lossy()
             .to_string();
             
         Self {
             mfs_mount,
-            laszoo_dir,
             hostname,
         }
     }
 
     pub fn manifest_path(&self) -> PathBuf {
-        crate::fs::get_host_dir(&self.mfs_mount, &self.laszoo_dir, &self.hostname)
+        crate::fs::get_machine_dir(&self.mfs_mount, "", &self.hostname)
             .join("manifest.json")
     }
 
@@ -91,14 +89,35 @@ impl EnrollmentManager {
         manifest.save(&self.manifest_path())
     }
 
-    pub fn enroll_file(&self, file_path: &Path, group: &str, force: bool) -> Result<()> {
-        // Ensure file exists
-        if !file_path.exists() {
+    /// Enroll a file or directory into a group
+    pub fn enroll_path(&self, group: &str, path: Option<&Path>, force: bool) -> Result<()> {
+        // If no path specified, enroll the machine into the group
+        if path.is_none() {
+            return self.enroll_machine_to_group(group);
+        }
+
+        let path = path.unwrap();
+        
+        // Ensure path exists
+        if !path.exists() {
             return Err(LaszooError::FileNotFound { 
-                path: file_path.to_path_buf() 
+                path: path.to_path_buf() 
             });
         }
 
+        if path.is_file() {
+            self.enroll_file(path, group, force)
+        } else if path.is_dir() {
+            self.enroll_directory(path, group, force)
+        } else {
+            Err(LaszooError::InvalidPath { 
+                path: path.to_path_buf() 
+            })
+        }
+    }
+
+    /// Enroll a file into a group
+    pub fn enroll_file(&self, file_path: &Path, group: &str, force: bool) -> Result<()> {
         // Check permissions
         if let Err(_) = fs::metadata(file_path) {
             return Err(LaszooError::PermissionDenied { 
@@ -126,22 +145,30 @@ impl EnrollmentManager {
         // Calculate checksum
         let checksum = self.calculate_checksum(&abs_path)?;
         
-        // Create symlink in MooseFS
-        let template_path = crate::fs::get_template_path(
+        // Read file content
+        let content = fs::read_to_string(&abs_path)?;
+        
+        // Create/update group template
+        let group_template_path = crate::fs::get_group_template_path(
             &self.mfs_mount, 
-            &self.laszoo_dir, 
-            &self.hostname,
+            "", 
+            group,
             &abs_path
         )?;
         
         // Ensure parent directory exists
-        if let Some(parent) = template_path.parent() {
+        if let Some(parent) = group_template_path.parent() {
             fs::create_dir_all(parent)?;
         }
         
-        // Copy file to MooseFS
-        fs::copy(&abs_path, &template_path)?;
-        info!("Copied file to {:?}", template_path);
+        // If this is the first enrollment for this file in this group, create template
+        if !group_template_path.exists() {
+            fs::write(&group_template_path, &content)?;
+            info!("Created group template at {:?}", group_template_path);
+            
+            // Copy metadata
+            self.copy_metadata(&abs_path, &group_template_path)?;
+        }
         
         // Create enrollment entry
         let entry = EnrollmentEntry {
@@ -150,7 +177,7 @@ impl EnrollmentManager {
             group: group.to_string(),
             enrolled_at: chrono::Utc::now(),
             last_synced: None,
-            template_path: Some(template_path),
+            template_path: Some(group_template_path),
         };
         
         // Add to manifest
@@ -161,19 +188,123 @@ impl EnrollmentManager {
         Ok(())
     }
 
+    /// Enroll a directory recursively
+    fn enroll_directory(&self, dir_path: &Path, group: &str, force: bool) -> Result<()> {
+        let abs_path = dir_path.canonicalize()?;
+        
+        for entry in walkdir::WalkDir::new(&abs_path) {
+            let entry = entry?;
+            if entry.file_type().is_file() {
+                if let Err(e) = self.enroll_file(entry.path(), group, force) {
+                    warn!("Failed to enroll {:?}: {}", entry.path(), e);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Enroll a machine into a group without specifying files
+    fn enroll_machine_to_group(&self, group: &str) -> Result<()> {
+        info!("Enrolling machine {} into group {}", self.hostname, group);
+        
+        // Check if group exists
+        let group_dir = crate::fs::get_group_dir(&self.mfs_mount, "", group);
+        if !group_dir.exists() {
+            return Err(LaszooError::GroupNotFound { 
+                name: group.to_string() 
+            });
+        }
+        
+        // Apply all templates from the group
+        self.apply_group_templates(group)?;
+        
+        Ok(())
+    }
+
+    /// Apply all templates from a group to the local system
+    pub fn apply_group_templates(&self, group: &str) -> Result<()> {
+        let group_dir = crate::fs::get_group_dir(&self.mfs_mount, "", group);
+        
+        // Walk the group directory
+        for entry in walkdir::WalkDir::new(&group_dir) {
+            let entry = entry?;
+            if entry.file_type().is_file() && entry.path().extension() == Some(std::ffi::OsStr::new("lasz")) {
+                let template_path = entry.path();
+                
+                // Extract the original file path from the template path
+                let relative_path = template_path.strip_prefix(&group_dir)
+                    .map_err(|_| LaszooError::Other("Invalid template path structure".to_string()))?;
+                let original_path = PathBuf::from("/").join(relative_path.with_extension(""));
+                
+                // Apply the template
+                self.apply_template(group, template_path, &original_path)?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Apply a single template to create/update a local file
+    fn apply_template(&self, group: &str, template_path: &Path, target_path: &Path) -> Result<()> {
+        info!("Applying template {:?} to {:?}", template_path, target_path);
+        
+        // Read template content
+        let template_content = fs::read_to_string(template_path)?;
+        
+        // Check for machine-specific .lasz file
+        let machine_lasz_path = crate::fs::get_machine_file_path(
+            &self.mfs_mount,
+            "",
+            &self.hostname,
+            target_path
+        )?.with_extension("lasz");
+        
+        // Process content based on whether machine-specific template exists
+        let final_content = if machine_lasz_path.exists() {
+            let machine_content = fs::read_to_string(&machine_lasz_path)?;
+            crate::template::process_with_quacks(&template_content, &machine_content)?
+        } else {
+            // Just process handlebars variables
+            crate::template::process_handlebars(&template_content, &self.hostname)?
+        };
+        
+        // Create parent directory if needed
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        
+        // Write the processed content
+        fs::write(target_path, &final_content)?;
+        
+        // Copy metadata from template
+        self.copy_metadata(template_path, target_path)?;
+        
+        // Update manifest
+        let mut manifest = self.load_manifest()?;
+        let checksum = self.calculate_checksum(target_path)?;
+        
+        let entry = EnrollmentEntry {
+            original_path: target_path.to_path_buf(),
+            checksum,
+            group: group.to_string(),
+            enrolled_at: chrono::Utc::now(),
+            last_synced: Some(chrono::Utc::now()),
+            template_path: Some(template_path.to_path_buf()),
+        };
+        
+        manifest.add_entry(entry);
+        self.save_manifest(&manifest)?;
+        
+        Ok(())
+    }
+
     pub fn unenroll_file(&self, file_path: &Path) -> Result<()> {
         let abs_path = file_path.canonicalize()?;
         let mut manifest = self.load_manifest()?;
         
         if let Some(entry) = manifest.remove_entry(&abs_path) {
-            // Remove template file if it exists
-            if let Some(template_path) = &entry.template_path {
-                if template_path.exists() {
-                    fs::remove_file(template_path)?;
-                    debug!("Removed template file: {:?}", template_path);
-                }
-            }
-            
+            // Note: We don't remove the group template as other machines might be using it
             self.save_manifest(&manifest)?;
             info!("Successfully unenrolled {:?}", abs_path);
             Ok(())
@@ -218,6 +349,30 @@ impl EnrollmentManager {
         let mut hasher = Sha256::new();
         std::io::copy(&mut file, &mut hasher)?;
         Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    fn copy_metadata(&self, from: &Path, to: &Path) -> Result<()> {
+        let metadata = fs::metadata(from)?;
+        
+        // Copy permissions
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = metadata.permissions();
+            fs::set_permissions(to, permissions)?;
+        }
+        
+        // Note: Owner/group copying would require elevated privileges
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let uid = metadata.uid();
+            let gid = metadata.gid();
+            debug!("Cannot copy ownership (uid: {}, gid: {}) to {:?} - requires elevated privileges", 
+                  uid, gid, to);
+        }
+        
+        Ok(())
     }
 }
 

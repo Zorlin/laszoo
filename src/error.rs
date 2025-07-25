@@ -18,6 +18,9 @@ pub enum LaszooError {
     #[error("File already enrolled in group {group}: {path}")]
     AlreadyEnrolled { path: PathBuf, group: String },
     
+    #[error("Invalid path: {path}")]
+    InvalidPath { path: PathBuf },
+    
     #[error("Group not found: {name}")]
     GroupNotFound { name: String },
     
@@ -44,6 +47,12 @@ pub enum LaszooError {
     
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+    
+    #[error("Walkdir error: {0}")]
+    Walkdir(#[from] walkdir::Error),
+    
+    #[error("Regex error: {0}")]
+    Regex(#[from] regex::Error),
     
     #[error("Other error: {0}")]
     Other(String),

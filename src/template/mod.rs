@@ -160,6 +160,36 @@ impl TemplateEngine {
     }
 }
 
+/// Process template with handlebars variables only
+pub fn process_handlebars(template_content: &str, hostname: &str) -> Result<String> {
+    let engine = TemplateEngine::new()?;
+    let mut vars = HashMap::new();
+    vars.insert("hostname".to_string(), serde_json::json!(hostname));
+    
+    // Add more system variables as needed
+    engine.process_template(template_content, &vars, false)
+}
+
+/// Process template with quack tags from machine-specific content
+pub fn process_with_quacks(group_template: &str, machine_template: &str) -> Result<String> {
+    let engine = TemplateEngine::new()?;
+    
+    // Extract quack tags from machine template
+    let machine_quacks = engine.extract_quack_tags(machine_template);
+    
+    // Replace {{ quack }} placeholders in group template with machine-specific content
+    let mut result = group_template.to_string();
+    let quack_placeholder_regex = Regex::new(r"\{\{\s*quack\s*\}\}")?;
+    
+    for (i, caps) in quack_placeholder_regex.find_iter(group_template).enumerate() {
+        if let Some(quack_tag) = machine_quacks.get(i) {
+            result = result.replacen(caps.as_str(), &quack_tag.content, 1);
+        }
+    }
+    
+    Ok(result)
+}
+
 #[derive(Debug, Clone)]
 pub struct QuackTag {
     pub id: usize,

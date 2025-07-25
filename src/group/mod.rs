@@ -4,7 +4,6 @@ use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Utc};
 use tracing::{info, debug, warn};
 use crate::error::{LaszooError, Result};
-use crate::fs::get_laszoo_base;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
@@ -23,12 +22,11 @@ pub struct GroupManifest {
 
 pub struct GroupManager {
     mfs_mount: PathBuf,
-    laszoo_dir: String,
 }
 
 impl GroupManager {
-    pub fn new(mfs_mount: PathBuf, laszoo_dir: String) -> Self {
-        Self { mfs_mount, laszoo_dir }
+    pub fn new(mfs_mount: PathBuf, _laszoo_dir: String) -> Self {
+        Self { mfs_mount }
     }
     
     /// Load the group manifest
@@ -196,12 +194,12 @@ impl GroupManager {
     
     /// Count enrolled files in a group (helper for deletion check)
     fn count_enrolled_files_in_group(&self, group_name: &str) -> Result<usize> {
-        let base_path = get_laszoo_base(&self.mfs_mount, &self.laszoo_dir);
+        let machines_dir = self.mfs_mount.join("machines");
         let mut count = 0;
         
         // Check all host directories
-        if base_path.exists() {
-            for entry in std::fs::read_dir(&base_path)? {
+        if machines_dir.exists() {
+            for entry in std::fs::read_dir(&machines_dir)? {
                 let entry = entry?;
                 if entry.file_type()?.is_dir() {
                     let manifest_path = entry.path().join("manifest.json");
@@ -228,6 +226,6 @@ impl GroupManager {
     
     /// Get the path to the group manifest
     fn manifest_path(&self) -> PathBuf {
-        get_laszoo_base(&self.mfs_mount, &self.laszoo_dir).join("groups.json")
+        self.mfs_mount.join("groups.json")
     }
 }

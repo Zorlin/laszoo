@@ -8,7 +8,6 @@ use crate::cli::SyncStrategy;
 
 pub struct SyncEngine {
     mfs_mount: PathBuf,
-    laszoo_dir: String,
     hostname: String,
     template_engine: TemplateEngine,
 }
@@ -41,7 +40,7 @@ pub enum SyncOperationType {
 }
 
 impl SyncEngine {
-    pub fn new(mfs_mount: PathBuf, laszoo_dir: String) -> Result<Self> {
+    pub fn new(mfs_mount: PathBuf, _laszoo_dir: String) -> Result<Self> {
         let hostname = gethostname::gethostname()
             .to_string_lossy()
             .to_string();
@@ -50,7 +49,6 @@ impl SyncEngine {
         
         Ok(Self {
             mfs_mount,
-            laszoo_dir,
             hostname,
             template_engine,
         })
@@ -67,7 +65,7 @@ impl SyncEngine {
         // Get enrolled files for this group on current host
         let manager = EnrollmentManager::new(
             self.mfs_mount.clone(),
-            self.laszoo_dir.clone()
+            "".to_string()
         );
         let local_entries = manager.list_enrolled_files(Some(group))?;
         
@@ -184,11 +182,11 @@ impl SyncEngine {
     
     /// Discover all hosts in the cluster
     fn discover_hosts(&self) -> Result<Vec<String>> {
-        let laszoo_base = crate::fs::get_laszoo_base(&self.mfs_mount, &self.laszoo_dir);
+        let machines_dir = self.mfs_mount.join("machines");
         
         let mut hosts = Vec::new();
-        if laszoo_base.exists() {
-            for entry in std::fs::read_dir(laszoo_base)? {
+        if machines_dir.exists() {
+            for entry in std::fs::read_dir(machines_dir)? {
                 let entry = entry?;
                 if entry.file_type()?.is_dir() {
                     if let Some(hostname) = entry.file_name().to_str() {
@@ -214,7 +212,7 @@ impl SyncEngine {
         // Check file on each host
         for host in all_hosts {
             let host_manifest_path = self.mfs_mount
-                .join(&self.laszoo_dir)
+                .join("machines")
                 .join(host)
                 .join("manifest.json");
                 
@@ -273,52 +271,25 @@ impl SyncEngine {
                 // Update local manifest with new checksum
                 let manager = EnrollmentManager::new(
                     self.mfs_mount.clone(),
-                    self.laszoo_dir.clone()
+                    "".to_string()
                 );
                 
                 // Re-enroll to update checksum
                 manager.enroll_file(&operation.file_path, &operation.group, true)?;
             }
-            SyncOperationType::Forward { local_content } => {
+            SyncOperationType::Forward { local_content: _ } => {
                 info!("Forwarding {:?} to all hosts", operation.file_path);
                 
-                // Copy local file to all other hosts' template paths
-                for host in &operation.target_hosts {
-                    if host != &self.hostname {
-                        let target_template = crate::fs::get_template_path(
-                            &self.mfs_mount,
-                            &self.laszoo_dir,
-                            host,
-                            &operation.file_path
-                        )?;
-                        
-                        if let Some(parent) = target_template.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        
-                        std::fs::write(&target_template, &local_content)?;
-                        debug!("Forwarded to {}: {:?}", host, target_template);
-                    }
-                }
+                // TODO: Update to use group templates instead of host-to-host sync
+                warn!("Forward sync not yet implemented with new group template architecture");
+                return Err(LaszooError::Other("Forward sync needs refactoring for group templates".to_string()));
             }
-            SyncOperationType::CreateTemplate { template_content, divergent_sections } => {
-                info!("Creating template for {:?} with {} divergent sections", 
-                    operation.file_path, divergent_sections.len());
+            SyncOperationType::CreateTemplate { template_content: _, divergent_sections: _ } => {
+                info!("Creating template for {:?}", operation.file_path);
                 
-                // Save template to local template path
-                let template_path = crate::fs::get_template_path(
-                    &self.mfs_mount,
-                    &self.laszoo_dir,
-                    &self.hostname,
-                    &operation.file_path
-                )?;
-                
-                std::fs::write(&template_path, template_content)?;
-                
-                // Log divergent sections
-                for (content, hosts) in divergent_sections {
-                    warn!("Divergent section on hosts {:?}: {}", hosts, content);
-                }
+                // TODO: Update to save as group template instead
+                warn!("CreateTemplate not yet implemented with new group template architecture");
+                return Err(LaszooError::Other("CreateTemplate needs refactoring for group templates".to_string()));
             }
         }
         

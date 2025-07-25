@@ -4,13 +4,9 @@ use crate::error::{LaszooError, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// MooseFS mount point
+    /// MooseFS mount point (this is the Laszoo root directory)
     #[serde(default = "default_mfs_mount")]
     pub mfs_mount: PathBuf,
-    
-    /// Laszoo data directory in MooseFS
-    #[serde(default = "default_laszoo_dir")]
-    pub laszoo_dir: String,
     
     /// Default sync strategy
     #[serde(default = "default_sync_strategy")]
@@ -70,7 +66,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             mfs_mount: default_mfs_mount(),
-            laszoo_dir: default_laszoo_dir(),
             default_sync_strategy: default_sync_strategy(),
             auto_commit: default_auto_commit(),
             ollama_endpoint: default_ollama_endpoint(),
@@ -150,9 +145,6 @@ impl Config {
             self.mfs_mount = PathBuf::from(mount);
         }
         
-        if let Ok(dir) = std::env::var("LASZOO_DIR") {
-            self.laszoo_dir = dir;
-        }
         
         if let Ok(strategy) = std::env::var("LASZOO_SYNC_STRATEGY") {
             self.default_sync_strategy = strategy;
@@ -189,7 +181,7 @@ impl Config {
     
     /// Get the full path to the Laszoo directory in MooseFS
     pub fn laszoo_path(&self) -> PathBuf {
-        self.mfs_mount.join(&self.laszoo_dir)
+        self.mfs_mount.clone()
     }
     
     /// Get the path for a specific host's data
@@ -200,12 +192,9 @@ impl Config {
 
 // Default value functions
 fn default_mfs_mount() -> PathBuf {
-    PathBuf::from("/mnt/mfs")
+    PathBuf::from("/mnt/laszoo")
 }
 
-fn default_laszoo_dir() -> String {
-    "laszoo".to_string()
-}
 
 fn default_sync_strategy() -> String {
     "auto".to_string()

@@ -74,14 +74,14 @@ pub enum Commands {
         commits: u32,
     },
     
-    /// Apply template to generate configuration
+    /// Apply templates from a group to the local system
     Apply {
-        /// Template file to apply
-        template: PathBuf,
+        /// Group name to apply templates from
+        group: String,
         
-        /// Output file (stdout if not specified)
+        /// Apply only specific files (all if not specified)
         #[arg(short, long)]
-        output: Option<PathBuf>,
+        files: Vec<PathBuf>,
     },
     
     /// Manage groups
@@ -92,8 +92,8 @@ pub enum Commands {
     
     /// Initialize Laszoo in current directory
     Init {
-        /// MooseFS mount point
-        #[arg(long, default_value = "/mnt/mfs")]
+        /// Shared filesystem mount point
+        #[arg(long, default_value = "/mnt/laszoo")]
         mfs_mount: PathBuf,
     },
     

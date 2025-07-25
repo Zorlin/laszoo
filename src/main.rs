@@ -60,8 +60,8 @@ async fn run() -> Result<()> {
             // TODO: Implement rollback
             println!("Rollback not yet implemented");
         }
-        Commands::Apply { template, output: _ } => {
-            apply_template(&config, &template).await?;
+        Commands::Apply { group, files } => {
+            apply_group_templates(&config, &group, files).await?;
         }
         Commands::Group { command } => {
             handle_group_command(command).await?;
@@ -77,11 +77,20 @@ async fn init_laszoo(config: &Config, mfs_mount: &std::path::Path) -> Result<()>
     // Check if distributed filesystem is available
     crate::fs::ensure_distributed_fs_available(mfs_mount)?;
     
-    // Create Laszoo directory structure
-    let laszoo_path = mfs_mount.join(&config.laszoo_dir);
-    if !laszoo_path.exists() {
-        std::fs::create_dir_all(&laszoo_path)?;
-        info!("Created Laszoo directory at {:?}", laszoo_path);
+    // Mount point is the Laszoo directory itself - no subdirectory needed
+    
+    // Create machines directory
+    let machines_dir = mfs_mount.join("machines");
+    if !machines_dir.exists() {
+        std::fs::create_dir_all(&machines_dir)?;
+        info!("Created machines directory at {:?}", machines_dir);
+    }
+    
+    // Create groups directory
+    let groups_dir = mfs_mount.join("groups");
+    if !groups_dir.exists() {
+        std::fs::create_dir_all(&groups_dir)?;
+        info!("Created groups directory at {:?}", groups_dir);
     }
     
     // Get hostname
@@ -90,7 +99,7 @@ async fn init_laszoo(config: &Config, mfs_mount: &std::path::Path) -> Result<()>
         .to_string();
     
     // Create host-specific directory
-    let host_path = laszoo_path.join(&hostname);
+    let host_path = machines_dir.join(&hostname);
     if !host_path.exists() {
         std::fs::create_dir_all(&host_path)?;
         info!("Created host directory at {:?}", host_path);
@@ -129,56 +138,28 @@ async fn enroll_files(
     // Create enrollment manager
     let manager = EnrollmentManager::new(
         config.mfs_mount.clone(),
-        config.laszoo_dir.clone()
+        "".to_string()
     );
+    
+    // If no paths provided, enroll the machine into the group
+    if paths.is_empty() {
+        manager.enroll_path(group, None, force)?;
+        info!("Successfully enrolled machine into group '{}'", group);
+        return Ok(());
+    }
     
     let mut enrolled_count = 0;
     let mut error_count = 0;
     
     for path in paths {
-        // Expand path if it's a directory
-        let files = if path.is_dir() {
-            let mut files = Vec::new();
-            for entry in walkdir::WalkDir::new(&path)
-                .follow_links(false)
-                .into_iter()
-                .filter_entry(|e| {
-                    // Skip hidden files unless requested
-                    if !include_hidden && e.file_name()
-                        .to_str()
-                        .map_or(false, |s| s.starts_with('.')) {
-                        return false;
-                    }
-                    true
-                })
-            {
-                match entry {
-                    Ok(e) if e.file_type().is_file() => {
-                        files.push(e.path().to_path_buf());
-                    }
-                    Err(e) => {
-                        error!("Error walking directory: {}", e);
-                        error_count += 1;
-                    }
-                    _ => {}
-                }
+        match manager.enroll_path(group, Some(&path), force) {
+            Ok(_) => {
+                info!("Enrolled: {:?}", path);
+                enrolled_count += 1;
             }
-            files
-        } else {
-            vec![path]
-        };
-        
-        // Enroll each file
-        for file_path in files {
-            match manager.enroll_file(&file_path, group, force) {
-                Ok(_) => {
-                    info!("Enrolled: {:?}", file_path);
-                    enrolled_count += 1;
-                }
-                Err(e) => {
-                    error!("Failed to enroll {:?}: {}", file_path, e);
-                    error_count += 1;
-                }
+            Err(e) => {
+                error!("Failed to enroll {:?}: {}", path, e);
+                error_count += 1;
             }
         }
     }
@@ -195,44 +176,33 @@ async fn enroll_files(
     }
 }
 
-async fn apply_template(config: &Config, template_path: &Path) -> Result<()> {
-    use crate::template::TemplateEngine;
-    use std::collections::HashMap;
+async fn apply_group_templates(config: &Config, group: &str, files: Vec<PathBuf>) -> Result<()> {
+    use crate::enrollment::EnrollmentManager;
     
-    // Read template file
-    let template_content = std::fs::read_to_string(template_path)
-        .map_err(|_| LaszooError::FileNotFound { 
-            path: template_path.to_path_buf() 
-        })?;
+    // Ensure distributed filesystem is available
+    crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
     
-    // Create template engine
-    let engine = TemplateEngine::new()?;
+    // Create enrollment manager
+    let manager = EnrollmentManager::new(
+        config.mfs_mount.clone(),
+        "".to_string()
+    );
     
-    // Get hostname for variables
-    let hostname = gethostname::gethostname()
-        .to_string_lossy()
-        .to_string();
-    
-    // Build default variables
-    let mut variables = HashMap::new();
-    variables.insert("hostname".to_string(), serde_json::json!(hostname));
-    variables.insert("laszoo_dir".to_string(), serde_json::json!(config.laszoo_dir));
-    
-    // Add environment variables
-    for (key, value) in std::env::vars() {
-        if key.starts_with("LASZOO_") {
-            let var_name = key.strip_prefix("LASZOO_").unwrap().to_lowercase();
-            variables.insert(var_name, serde_json::json!(value));
+    if files.is_empty() {
+        // Apply all templates from the group
+        info!("Applying all templates from group '{}'", group);
+        manager.apply_group_templates(group)?;
+        println!("Successfully applied all templates from group '{}'", group);
+    } else {
+        // Apply specific files
+        info!("Applying {} specific files from group '{}'", files.len(), group);
+        for file in files {
+            // TODO: Implement applying specific files
+            println!("Applying specific files not yet implemented");
+            return Err(LaszooError::Other("Applying specific files not yet implemented".to_string()));
         }
     }
     
-    // Process template (preserve quack tags by default)
-    let result = engine.process_template(&template_content, &variables, true)?;
-    
-    // Output result
-    println!("{}", result);
-    
-    info!("Successfully processed template {:?}", template_path);
     Ok(())
 }
 
@@ -245,7 +215,7 @@ async fn show_status(config: &Config) -> Result<()> {
     // Create enrollment manager
     let manager = EnrollmentManager::new(
         config.mfs_mount.clone(),
-        config.laszoo_dir.clone()
+        "".to_string()
     );
     
     // Load manifest and show enrolled files
@@ -304,7 +274,7 @@ async fn sync_files(
     // Create sync engine
     let engine = SyncEngine::new(
         config.mfs_mount.clone(),
-        config.laszoo_dir.clone()
+        "".to_string()
     )?;
     
     if let Some(group_name) = group {
@@ -325,7 +295,7 @@ async fn sync_files(
         // Get all unique groups from manifest
         let manager = crate::enrollment::EnrollmentManager::new(
             config.mfs_mount.clone(),
-            config.laszoo_dir.clone()
+            "".to_string()
         );
         let manifest = manager.load_manifest()?;
         let groups: std::collections::HashSet<_> = manifest.entries
@@ -361,9 +331,8 @@ async fn commit_changes(
 ) -> Result<()> {
     use crate::git::GitManager;
     
-    // Use the laszoo directory as the git repo
-    let repo_path = crate::fs::get_laszoo_base(&config.mfs_mount, &config.laszoo_dir);
-    let git = GitManager::new(repo_path);
+    // Use the mount point as the git repo
+    let git = GitManager::new(config.mfs_mount.clone());
     
     // Check if there are changes
     if !git.has_changes()? {
@@ -429,7 +398,7 @@ async fn handle_group_command(command: GroupCommands) -> Result<()> {
     // Create group manager
     let manager = GroupManager::new(
         config.mfs_mount.clone(),
-        config.laszoo_dir.clone()
+        "".to_string()
     );
     
     match command {
