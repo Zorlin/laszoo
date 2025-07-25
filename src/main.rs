@@ -25,16 +25,16 @@ use crate::{
 async fn main() -> Result<()> {
     // Parse CLI arguments
     let cli = Cli::parse();
-    
+
     // Load configuration
     let config = Config::load(cli.config.as_deref())?;
-    
+
     // Initialize logging
     crate::logging::init_logging(&config.logging, cli.verbose)?;
-    
+
     // Log startup info
     info!("Starting Laszoo v{}", env!("CARGO_PKG_VERSION"));
-    
+
     match cli.command {
         Commands::Init { mfs_mount } => {
             init_laszoo(&config, &mfs_mount).await?;
@@ -72,76 +72,76 @@ async fn main() -> Result<()> {
             watch_for_changes(&config, group.as_deref(), interval, auto, hard).await?;
         }
     }
-    
+
     Ok(())
 }
 async fn init_laszoo(config: &Config, mfs_mount: &std::path::Path) -> Result<()> {
     info!("Initializing Laszoo with distributed filesystem at {:?}", mfs_mount);
-    
+
     // Check if distributed filesystem is available
     crate::fs::ensure_distributed_fs_available(mfs_mount)?;
-    
+
     // Mount point is the Laszoo directory itself - no subdirectory needed
-    
+
     // Create machines directory
     let machines_dir = mfs_mount.join("machines");
     if !machines_dir.exists() {
         std::fs::create_dir_all(&machines_dir)?;
         info!("Created machines directory at {:?}", machines_dir);
     }
-    
+
     // Create groups directory
     let groups_dir = mfs_mount.join("groups");
     if !groups_dir.exists() {
         std::fs::create_dir_all(&groups_dir)?;
         info!("Created groups directory at {:?}", groups_dir);
     }
-    
+
     // Get hostname
     let hostname = gethostname::gethostname()
         .to_string_lossy()
         .to_string();
-    
+
     // Create host-specific directory
     let host_path = machines_dir.join(&hostname);
     if !host_path.exists() {
         std::fs::create_dir_all(&host_path)?;
         info!("Created host directory at {:?}", host_path);
     }
-    
+
     // Initialize git repository
     let git = crate::git::GitManager::new(mfs_mount.to_path_buf());
     git.init_repo()?;
     info!("Initialized git repository at {:?}", mfs_mount);
-    
+
     // Create initial .gitignore
     let gitignore = mfs_mount.join(".gitignore");
     if !gitignore.exists() {
         std::fs::write(&gitignore, "# Laszoo Git Ignore\n*.swp\n*.tmp\n.DS_Store\n")?;
     }
-    
+
     // TODO: Implement git commit with Ollama integration
     // git.stage_all()?;
     // git.commit(&config.ollama_endpoint, &config.ollama_model, "Initial Laszoo setup").await?;
     // info!("Created initial git commit");
-    
+
     // Save configuration
     let config_path = mfs_mount.join("laszoo.toml");
     if !config_path.exists() {
         config.save(&config_path)?;
         info!("Saved configuration to {:?}", config_path);
     }
-    
+
     println!("Laszoo initialized successfully at {:?}", mfs_mount);
     println!("Hostname: {}", hostname);
-    
+
     Ok(())
 }
 
 async fn enroll_files(
-    config: &Config, 
-    group: &str, 
-    paths: Vec<PathBuf>, 
+    config: &Config,
+    group: &str,
+    paths: Vec<PathBuf>,
     force: bool,
     _include_hidden: bool,
     machine: bool,
@@ -151,32 +151,32 @@ async fn enroll_files(
     action: crate::cli::SyncAction
 ) -> Result<()> {
     use crate::enrollment::EnrollmentManager;
-    
+
     // Ensure distributed filesystem is available
     crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
-    
+
     // Create enrollment manager
     let manager = EnrollmentManager::new(
         config.mfs_mount.clone(),
         "".to_string()
     );
-    
+
     // If no paths provided, enroll the machine into the group
     if paths.is_empty() {
         manager.enroll_path(group, None, force, machine, hybrid)?;
         info!("Successfully enrolled machine into group '{}'", group);
-        
+
         // Store triggers and action for this group if provided
         if before.is_some() || after.is_some() || !matches!(action, crate::cli::SyncAction::Converge) {
             store_group_config(&config.mfs_mount, group, before.as_deref(), after.as_deref(), &action)?;
         }
-        
+
         return Ok(());
     }
-    
+
     let mut enrolled_count = 0;
     let mut error_count = 0;
-    
+
     for path in paths {
         match manager.enroll_path(group, Some(&path), force, machine, hybrid) {
             Ok(_) => {
@@ -189,15 +189,15 @@ async fn enroll_files(
             }
         }
     }
-    
+
     // Store triggers and action for this group if provided
     if enrolled_count > 0 && (before.is_some() || after.is_some() || !matches!(action, crate::cli::SyncAction::Converge)) {
         store_group_config(&config.mfs_mount, group, before.as_deref(), after.as_deref(), &action)?;
     }
-    
-    info!("Enrollment complete: {} files enrolled, {} errors", 
+
+    info!("Enrollment complete: {} files enrolled, {} errors",
           enrolled_count, error_count);
-    
+
     if error_count > 0 {
         Err(LaszooError::Other(
             format!("Enrollment completed with {} errors", error_count)
@@ -209,18 +209,18 @@ async fn enroll_files(
 
 async fn apply_group_templates(config: &Config, group: &str, files: Vec<PathBuf>) -> Result<()> {
     use crate::enrollment::EnrollmentManager;
-    
+
     // Ensure distributed filesystem is available
     crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
-    
+
     // Create enrollment manager
     let manager = EnrollmentManager::new(
         config.mfs_mount.clone(),
         "".to_string()
     );
-    
+
     info!("Applying all templates from group '{}'", group);
-    
+
     if files.is_empty() {
         // Add machine to group first
         manager.add_machine_to_group(group)?;
@@ -233,29 +233,29 @@ async fn apply_group_templates(config: &Config, group: &str, files: Vec<PathBuf>
             warn!("Selective file application not yet implemented");
         }
     }
-    
+
     println!("Successfully applied all templates from group '{}'", group);
     Ok(())
 }
 
 async fn unenroll_files(config: &Config, group: Option<String>, paths: Vec<PathBuf>) -> Result<()> {
     use crate::enrollment::EnrollmentManager;
-    
+
     // Ensure distributed filesystem is available
     crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
-    
+
     // Create enrollment manager
     let manager = EnrollmentManager::new(
         config.mfs_mount.clone(),
         "".to_string()
     );
-    
+
     // If only group provided without paths, show enrolled files in that group
     if let Some(group_name) = group {
         if paths.is_empty() {
             info!("Listing files enrolled in group '{}'", group_name);
             let entries = manager.list_enrolled_files(Some(&group_name))?;
-            
+
             if entries.is_empty() {
                 println!("No files enrolled in group '{}'", group_name);
             } else {
@@ -267,11 +267,11 @@ async fn unenroll_files(config: &Config, group: Option<String>, paths: Vec<PathB
             return Ok(());
         }
     }
-    
+
     // Unenroll specified files
     let mut unenrolled_count = 0;
     let mut error_count = 0;
-    
+
     for path in paths {
         match manager.unenroll_file(&path) {
             Ok(()) => {
@@ -284,10 +284,10 @@ async fn unenroll_files(config: &Config, group: Option<String>, paths: Vec<PathB
             }
         }
     }
-    
-    info!("Unenrollment complete: {} files unenrolled, {} errors", 
+
+    info!("Unenrollment complete: {} files unenrolled, {} errors",
           unenrolled_count, error_count);
-    
+
     if error_count > 0 {
         Err(LaszooError::Other(
             format!("Unenrollment completed with {} errors", error_count)
@@ -299,18 +299,18 @@ async fn unenroll_files(config: &Config, group: Option<String>, paths: Vec<PathB
 
 async fn show_status(config: &Config, detailed: bool) -> Result<()> {
     use crate::enrollment::EnrollmentManager;
-    
+
     // Ensure distributed filesystem is available
     crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
-    
+
     let hostname = gethostname::gethostname()
         .to_string_lossy()
         .to_string();
-    
+
     println!("=== Laszoo Status ===");
     println!("Mount Point: {:?}", config.mfs_mount);
     println!("Hostname: {}", hostname);
-    
+
     // Read machine's groups.conf
     let groups_file = config.mfs_mount
         .join("machines")
@@ -318,7 +318,7 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
         .join("etc")
         .join("laszoo")
         .join("groups.conf");
-    
+
     let machine_groups: Vec<String> = if groups_file.exists() {
         std::fs::read_to_string(&groups_file)?
             .lines()
@@ -328,33 +328,33 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
     } else {
         Vec::new()
     };
-    
+
     if machine_groups.is_empty() {
         println!("\nThis machine is not in any groups and has no enrolled files.");
         return Ok(());
     }
-    
+
     println!("\nGroups this machine belongs to:");
     for group in &machine_groups {
         println!("  • {}", group);
     }
-    
+
     // Create enrollment manager
     let enrollment_manager = EnrollmentManager::new(
         config.mfs_mount.clone(),
         "".to_string()
     );
     debug!("Created enrollment manager");
-    
+
     println!("\nEnrolled Files by Group:");
-    
+
     for group_name in &machine_groups {
         println!("\n  [{}]", group_name);
         debug!("Processing group '{}'", group_name);
-        
+
         // Load enrollments from both machine and group manifests
         let mut enrollments: HashMap<PathBuf, crate::enrollment::EnrollmentEntry> = HashMap::new();
-        
+
         // Load from group manifest
         match enrollment_manager.load_group_manifest(group_name) {
             Ok(group_manifest) => {
@@ -369,7 +369,7 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                 debug!("Failed to load group manifest for '{}': {}", group_name, e);
             }
         }
-        
+
         // Load from machine manifest (machine-specific enrollments)
         match enrollment_manager.load_manifest() {
             Ok(machine_manifest) => {
@@ -384,24 +384,24 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                 // This is OK - machine might not have any machine-specific enrollments
             }
         }
-        
+
         debug!("Found {} enrollments for group '{}'", enrollments.len(), group_name);
-        
+
         // Debug: write to file to bypass stderr capture issues
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/laszoo-debug.log") {
             use std::io::Write;
             writeln!(f, "Found {} enrollments for group '{}'", enrollments.len(), group_name).ok();
         }
-        
+
         if enrollments.is_empty() {
             println!("    (nothing enrolled)");
             continue;
         }
-        
+
         // Sort enrollments by path
         let mut entries: Vec<(&PathBuf, &crate::enrollment::EnrollmentEntry)> = enrollments.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
-        
+
         // Debug: write to file
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/laszoo-debug.log") {
             use std::io::Write;
@@ -410,8 +410,8 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                 writeln!(f, "  Entry: {} -> {}", path.display(), entry.checksum).ok();
             }
         }
-        
-        
+
+
         for (path, entry) in &entries {
             debug!("Processing path: {}", path.display());
             // Debug: write to file
@@ -419,21 +419,21 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                 use std::io::Write;
                 writeln!(f, "Processing entry: {} (checksum: {})", path.display(), entry.checksum).ok();
             }
-            
-            
+
             // Check if this is a directory or file enrollment
             debug!("Checking if checksum '{}' == 'directory'", entry.checksum);
+            debug!("About to enter if/else block");
             if entry.checksum == "directory" {
                 // Handle directory enrollment
                 let dir_path = path;
-                
+
                 // Count file statuses in directory
                 let mut file_count = 0;
                 let mut unchanged_count = 0;
                 let mut modified_count = 0;
                 let mut missing_count = 0;
                 let mut new_count = 0;
-                
+
                 if dir_path.exists() && dir_path.is_dir() {
                     if let Ok(entries) = std::fs::read_dir(dir_path) {
                         for entry in entries.flatten() {
@@ -441,10 +441,10 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                                 if metadata.is_file() {
                                     file_count += 1;
                                     let file_path = entry.path();
-                                    
+
                                     // Check if template exists for this file
                                     let template_path = enrollment_manager.get_group_template_path(group_name, &file_path)?;
-                                    
+
                                     if template_path.exists() {
                                         // Template exists, check if file matches
                                         if let Ok(template_content) = std::fs::read_to_string(&template_path) {
@@ -471,8 +471,8 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                                 }
                             }
                         }
-                    }
-                    
+                    } // End of if let Ok(entries) = std::fs::read_dir(dir_path)
+
                     // Determine overall directory status
                     let status = if modified_count > 0 {
                         "●"
@@ -481,32 +481,32 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                     } else {
                         "✓"
                     };
-                    
+
                     // Build status string
                     let mut status_parts = vec![format!("1 directory, {} files", file_count)];
-                    
+
                     if unchanged_count > 0 {
                         let percent = (unchanged_count * 100) / file_count;
                         status_parts.push(format!("✓ {}% ok ({}/{})", percent, unchanged_count, file_count));
                     }
-                    
+
                     if modified_count > 0 {
                         let percent = (modified_count * 100) / file_count;
                         status_parts.push(format!("● {}% modified ({}/{})", percent, modified_count, file_count));
                     }
-                    
+
                     if missing_count > 0 {
                         let percent = (missing_count * 100) / file_count;
                         status_parts.push(format!("✗ {}% missing ({}/{})", percent, missing_count, file_count));
                     }
-                    
+
                     if new_count > 0 {
                         let percent = (new_count * 100) / file_count;
                         status_parts.push(format!("? {}% new ({}/{})", percent, new_count, file_count));
                     }
-                    
+
                     println!("    {} {} ({})", status, dir_path.display(), status_parts.join(", "));
-                    
+
                     // Show enrollment timestamp for directory in detailed mode
                     if detailed {
                         println!("    Enrolled: {}", entry.enrolled_at.format("%Y-%m-%d %H:%M:%S"));
@@ -517,10 +517,10 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                             println!("    Mode: hybrid");
                         }
                     }
-                    
+
                     // Track which new files we show to avoid duplicates in detailed mode
                     let mut new_files_shown = HashSet::new();
-                    
+
                     if dir_path.exists() {
                         // Always show new files that need adoption
                         if new_count > 0 && dir_path.is_dir() {
@@ -543,7 +543,7 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                                     })
                                     .collect();
                                 new_files.sort();
-                                
+
                                 for file_path in new_files {
                                     let relative_path = file_path.strip_prefix(dir_path)
                                         .unwrap_or(&file_path);
@@ -552,7 +552,7 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                                 }
                             }
                         }
-                        
+
                         if detailed {
                             // Show existing files when in detailed mode (but skip new files already shown)
                             if dir_path.is_dir() {
@@ -568,16 +568,16 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                                         })
                                         .collect();
                                     files.sort();
-                                    
+
                                     for file_path in files {
                                         // Skip files we already showed as new
                                         if new_files_shown.contains(&file_path) {
                                             continue;
                                         }
-                                        
+
                                         // Check if template exists for this file
                                         let template_path = enrollment_manager.get_group_template_path(group_name, &file_path)?;
-                                        
+
                                         let file_status = if template_path.exists() {
                                             // Template exists, check if file matches
                                             if let Ok(template_content) = std::fs::read_to_string(&template_path) {
@@ -601,7 +601,7 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                                         } else {
                                             continue; // Skip new files - already shown above
                                         };
-                                        
+
                                         let relative_path = file_path.strip_prefix(dir_path)
                                             .unwrap_or(&file_path);
                                         println!("      {} {}", file_status, relative_path.display());
@@ -613,10 +613,11 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                         // Directory doesn't exist
                         println!("    ✗ {} (directory missing)", dir_path.display());
                     }
-                } else {
+                } // End of if dir_path.exists() && dir_path.is_dir()
+            } else {
                     // Handle individual file enrollment
-                    debug!("Handling individual file enrollment for: {}", path.display());
-                    
+                    debug!("IN ELSE BLOCK - Handling individual file enrollment for: {}", path.display());
+
                     // Debug: write to file that we entered else block
                     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/laszoo-debug.log") {
                         use std::io::Write;
@@ -653,16 +654,16 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                     } else {
                         "✗" // File missing
                     };
-                
+
                 debug!("About to print status '{}' for file '{}'", status, file_path.display());
                 println!("    {} {}", status, file_path.display());
-                
+
                 // Debug: write to file
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/laszoo-debug.log") {
                     use std::io::Write;
-                    writeln!(f, "Printed file: {} with status {}", file_path.display(), status).ok();
+                    writeln!(f, "SUCCESSFULLY PRINTED file: {} with status {}", file_path.display(), status).ok();
                 }
-                
+
                 if detailed {
                     if let Some(last_synced) = &entry.last_synced {
                         println!("      Last synced: {}", last_synced.format("%Y-%m-%d %H:%M:%S"));
@@ -675,20 +676,20 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                         println!("      Mode: hybrid");
                     }
                 }
-                }
-            }
+            }  // End of else block (individual file enrollment)
+            debug!("After if/else block for entry: {}", path.display());
             debug!("Finished processing entry: {}", path.display());
         }
-        
+
         // Debug: write to file
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/laszoo-debug.log") {
             use std::io::Write;
             writeln!(f, "Finished processing group '{}'", group_name).ok();
         }
     }
-    
+
     println!("\nLegend: ✓ = unchanged, ● = modified locally, ✗ = missing, ? = discovered");
-    
+
     Ok(())
 }
 
@@ -699,21 +700,21 @@ async fn sync_files(
     dry_run: bool,
 ) -> Result<()> {
     use crate::sync::SyncEngine;
-    
+
     // Ensure distributed filesystem is available
     crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
-    
+
     // Create sync engine
     let engine = SyncEngine::new(
         config.mfs_mount.clone(),
         "".to_string()
     )?;
-    
+
     if let Some(group_name) = group {
         // Sync specific group
         info!("Analyzing group '{}' for synchronization", group_name);
         let operations = engine.analyze_group(group_name).await?;
-        
+
         if operations.is_empty() {
             info!("No synchronization needed for group '{}'", group_name);
         } else {
@@ -723,7 +724,7 @@ async fn sync_files(
     } else {
         // Sync all groups
         info!("Analyzing all groups for synchronization");
-        
+
         // Get all unique groups from manifest
         let manager = crate::enrollment::EnrollmentManager::new(
             config.mfs_mount.clone(),
@@ -734,25 +735,25 @@ async fn sync_files(
             .values()
             .map(|e| e.group.clone())
             .collect();
-        
+
         let mut total_operations = 0;
         for group_name in groups {
             info!("Analyzing group '{}'", group_name);
             let operations = engine.analyze_group(&group_name).await?;
             total_operations += operations.len();
-            
+
             if !operations.is_empty() {
                 engine.execute_sync(operations, dry_run).await?;
             }
         }
-        
+
         if total_operations == 0 {
             info!("No synchronization needed across all groups");
         } else {
             info!("Synchronized {} files across all groups", total_operations);
         }
     }
-    
+
     Ok(())
 }
 
@@ -762,16 +763,16 @@ async fn commit_changes(
     stage_all: bool,
 ) -> Result<()> {
     use crate::git::GitManager;
-    
+
     // Use the mount point as the git repo
     let git = GitManager::new(config.mfs_mount.clone());
-    
+
     // Check if there are changes
     if !git.has_changes()? {
         info!("No changes to commit");
         return Ok(());
     }
-    
+
     // Show status
     let statuses = git.get_status()?;
     println!("Git status:");
@@ -787,7 +788,7 @@ async fn commit_changes(
         };
         println!("  {} {:?}", status_char, path);
     }
-    
+
     // Stage files if requested
     if stage_all {
         info!("Staging all changes");
@@ -799,13 +800,13 @@ async fn commit_changes(
             s.contains(git2::Status::INDEX_MODIFIED) ||
             s.contains(git2::Status::INDEX_DELETED)
         });
-        
+
         if !has_staged {
             warn!("No files staged for commit. Use --all to stage all changes.");
             return Ok(());
         }
     }
-    
+
     // Create commit with AI-generated message
     info!("Generating commit message with {}", config.ollama_model);
     let commit_id = git.commit_with_ai(
@@ -813,7 +814,7 @@ async fn commit_changes(
         &config.ollama_model,
         user_message,
     ).await?;
-    
+
     info!("Successfully created commit: {}", commit_id);
     Ok(())
 }
@@ -821,37 +822,37 @@ async fn commit_changes(
 async fn handle_group_command(group_name: &str, command: GroupCommands) -> Result<()> {
     // Load config to get MFS mount
     let config = Config::load(None)?;
-    
+
     // Ensure distributed filesystem is available
     crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
-    
+
     match command {
         GroupCommands::Add { machine } => {
             let machine_name = machine.unwrap_or_else(|| {
                 gethostname::gethostname().to_string_lossy().to_string()
             });
-            
+
             info!("Adding machine '{}' to group '{}'", machine_name, group_name);
-            
+
             // Create group directory if it doesn't exist
             let group_dir = config.mfs_mount.join("groups").join(group_name);
             if !group_dir.exists() {
                 std::fs::create_dir_all(&group_dir)?;
                 info!("Created new group '{}'", group_name);
             }
-            
+
             // Update machine's groups.conf
             update_machine_groups(&config.mfs_mount, &machine_name, group_name, true)?;
-            
+
             println!("Successfully added machine '{}' to group '{}'", machine_name, group_name);
         }
         GroupCommands::Remove { machine, keep } => {
             let machine_name = machine.unwrap_or_else(|| {
                 gethostname::gethostname().to_string_lossy().to_string()
             });
-            
+
             info!("Removing machine '{}' from group '{}'", machine_name, group_name);
-            
+
             // First check if the machine is actually in the group
             let groups_file = config.mfs_mount
                 .join("machines")
@@ -859,7 +860,7 @@ async fn handle_group_command(group_name: &str, command: GroupCommands) -> Resul
                 .join("etc")
                 .join("laszoo")
                 .join("groups.conf");
-            
+
             let mut in_group = false;
             if groups_file.exists() {
                 let groups: Vec<String> = std::fs::read_to_string(&groups_file)?
@@ -867,23 +868,23 @@ async fn handle_group_command(group_name: &str, command: GroupCommands) -> Resul
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
-                
+
                 in_group = groups.contains(&group_name.to_string());
             }
-            
+
             if !in_group {
                 println!("Machine '{}' is not in group '{}'", machine_name, group_name);
                 return Ok(());
             }
-            
+
             // Update machine's groups.conf
             update_machine_groups(&config.mfs_mount, &machine_name, group_name, false)?;
-            
+
             // Check if this was the last member of the group
             if !keep {
                 let mut has_members = false;
                 let machines_dir = config.mfs_mount.join("machines");
-                
+
                 if let Ok(entries) = std::fs::read_dir(&machines_dir) {
                     for entry in entries.flatten() {
                         if let Some(other_machine) = entry.file_name().to_str() {
@@ -893,7 +894,7 @@ async fn handle_group_command(group_name: &str, command: GroupCommands) -> Resul
                                     .join("etc")
                                     .join("laszoo")
                                     .join("groups.conf");
-                                
+
                                 if other_groups_file.exists() {
                                     let content = std::fs::read_to_string(&other_groups_file)?;
                                     if content.lines().any(|l| l.trim() == group_name) {
@@ -905,7 +906,7 @@ async fn handle_group_command(group_name: &str, command: GroupCommands) -> Resul
                         }
                     }
                 }
-                
+
                 if !has_members {
                     // Remove the group directory
                     let group_dir = config.mfs_mount.join("groups").join(group_name);
@@ -915,14 +916,14 @@ async fn handle_group_command(group_name: &str, command: GroupCommands) -> Resul
                     }
                 }
             }
-            
+
             println!("Successfully removed machine '{}' from group '{}'", machine_name, group_name);
         }
         GroupCommands::List {} => {
             info!("Listing machines in group '{}'", group_name);
-            
+
             let machines = list_machines_in_group(&config.mfs_mount, group_name)?;
-            
+
             if machines.is_empty() {
                 println!("No machines in group '{}'", group_name);
             } else {
@@ -934,19 +935,19 @@ async fn handle_group_command(group_name: &str, command: GroupCommands) -> Resul
         }
         GroupCommands::Rename { new_name } => {
             info!("Renaming group '{}' to '{}'", group_name, new_name);
-            
+
             // Check if new group already exists
             let new_group_dir = config.mfs_mount.join("groups").join(&new_name);
             if new_group_dir.exists() {
                 return Err(LaszooError::Other(format!("Group '{}' already exists", new_name)));
             }
-            
+
             // Rename group directory
             let old_group_dir = config.mfs_mount.join("groups").join(group_name);
             if old_group_dir.exists() {
                 std::fs::rename(&old_group_dir, &new_group_dir)?;
             }
-            
+
             // Update all machines' groups.conf files
             let machines_dir = config.mfs_mount.join("machines");
             if let Ok(entries) = std::fs::read_dir(&machines_dir) {
@@ -957,47 +958,47 @@ async fn handle_group_command(group_name: &str, command: GroupCommands) -> Resul
                             .join("etc")
                             .join("laszoo")
                             .join("groups.conf");
-                        
+
                         if groups_file.exists() {
                             let content = std::fs::read_to_string(&groups_file)?;
                             let groups: Vec<String> = content
                                 .lines()
                                 .map(|l| if l.trim() == group_name { new_name.to_string() } else { l.to_string() })
                                 .collect();
-                            
+
                             std::fs::write(&groups_file, groups.join("\n") + "\n")?;
                         }
                     }
                 }
             }
-            
+
             println!("Successfully renamed group '{}' to '{}'", group_name, new_name);
         }
     }
-    
+
     Ok(())
 }
 
 async fn handle_groups_command(command: GroupsCommands) -> Result<()> {
     // Load config to get MFS mount
     let config = Config::load(None)?;
-    
+
     // Ensure distributed filesystem is available
     crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
-    
+
     match command {
         GroupsCommands::List {} => {
             info!("Listing all groups");
-            
+
             let groups_dir = config.mfs_mount.join("groups");
-            
+
             if !groups_dir.exists() {
                 println!("No groups exist yet.");
                 return Ok(());
             }
-            
+
             let mut groups = Vec::new();
-            
+
             if let Ok(entries) = std::fs::read_dir(&groups_dir) {
                 for entry in entries.flatten() {
                     if let Ok(metadata) = entry.metadata() {
@@ -1011,16 +1012,16 @@ async fn handle_groups_command(command: GroupsCommands) -> Result<()> {
                     }
                 }
             }
-            
+
             if groups.is_empty() {
                 println!("No groups exist yet.");
             } else {
                 groups.sort_by(|a, b| a.0.cmp(&b.0));
-                
+
                 println!("Groups:");
                 for (group_name, machine_count) in groups {
-                    println!("  • {} ({} machine{})", 
-                        group_name, 
+                    println!("  • {} ({} machine{})",
+                        group_name,
                         machine_count,
                         if machine_count == 1 { "" } else { "s" }
                     );
@@ -1028,7 +1029,7 @@ async fn handle_groups_command(command: GroupsCommands) -> Result<()> {
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -1040,12 +1041,12 @@ fn update_machine_groups(mfs_mount: &Path, machine_name: &str, group_name: &str,
         .join("etc")
         .join("laszoo")
         .join("groups.conf");
-    
+
     // Create directory if needed
     if let Some(parent) = groups_file.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    
+
     // Read existing groups
     let mut groups: Vec<String> = if groups_file.exists() {
         std::fs::read_to_string(&groups_file)?
@@ -1056,7 +1057,7 @@ fn update_machine_groups(mfs_mount: &Path, machine_name: &str, group_name: &str,
     } else {
         Vec::new()
     };
-    
+
     if add {
         if !groups.contains(&group_name.to_string()) {
             groups.push(group_name.to_string());
@@ -1065,13 +1066,13 @@ fn update_machine_groups(mfs_mount: &Path, machine_name: &str, group_name: &str,
     } else {
         groups.retain(|g| g != group_name);
     }
-    
+
     // Write back
     std::fs::write(&groups_file, groups.join("\n") + "\n")?;
-    
+
     // Update symlinks in group directories
     update_group_symlinks(mfs_mount, machine_name, &groups)?;
-    
+
     Ok(())
 }
 
@@ -1079,7 +1080,7 @@ fn update_machine_groups(mfs_mount: &Path, machine_name: &str, group_name: &str,
 fn update_group_symlinks(mfs_mount: &Path, machine_name: &str, groups: &[String]) -> Result<()> {
     let groups_dir = mfs_mount.join("groups");
     let machine_path = Path::new("../../../machines").join(machine_name);
-    
+
     // Remove old symlinks
     if let Ok(entries) = std::fs::read_dir(&groups_dir) {
         for entry in entries.flatten() {
@@ -1093,18 +1094,18 @@ fn update_group_symlinks(mfs_mount: &Path, machine_name: &str, groups: &[String]
             }
         }
     }
-    
+
     // Create new symlinks
     for group in groups {
         let group_machines_dir = groups_dir.join(group).join("machines");
-        
+
         // Create machines directory if needed
         if !group_machines_dir.exists() {
             std::fs::create_dir_all(&group_machines_dir)?;
         }
-        
+
         let symlink_path = group_machines_dir.join(machine_name);
-        
+
         // Create symlink
         #[cfg(unix)]
         {
@@ -1112,7 +1113,7 @@ fn update_group_symlinks(mfs_mount: &Path, machine_name: &str, groups: &[String]
             let _ = symlink(&machine_path, &symlink_path);
         }
     }
-    
+
     Ok(())
 }
 
@@ -1129,7 +1130,7 @@ fn calculate_file_checksum(path: &Path) -> Result<String> {
 fn list_machines_in_group(mfs_mount: &Path, group_name: &str) -> Result<Vec<String>> {
     let machines_dir = mfs_mount.join("machines");
     let mut machines = Vec::new();
-    
+
     if let Ok(entries) = std::fs::read_dir(&machines_dir) {
         for entry in entries.flatten() {
             if let Some(machine_name) = entry.file_name().to_str() {
@@ -1138,7 +1139,7 @@ fn list_machines_in_group(mfs_mount: &Path, group_name: &str) -> Result<Vec<Stri
                     .join("etc")
                     .join("laszoo")
                     .join("groups.conf");
-                
+
                 if groups_file.exists() {
                     let content = std::fs::read_to_string(&groups_file)?;
                     if content.lines().any(|l| l.trim() == group_name) {
@@ -1148,7 +1149,7 @@ fn list_machines_in_group(mfs_mount: &Path, group_name: &str) -> Result<Vec<Stri
             }
         }
     }
-    
+
     machines.sort();
     Ok(machines)
 }
@@ -1157,15 +1158,15 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
     use std::sync::mpsc::channel;
     use std::time::Duration;
     use std::collections::HashSet;
-    
+
     info!("Starting watch mode for group: {:?}, auto: {}", group, auto);
-    
+
     let hostname = gethostname::gethostname().to_string_lossy().to_string();
     let enrollment_manager = crate::enrollment::EnrollmentManager::new(
         config.mfs_mount.clone(),
         hostname.clone(),
     );
-    
+
     println!("Starting watch mode...");
     if auto {
         println!("Auto-apply mode enabled - changes will be applied automatically");
@@ -1173,7 +1174,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
         println!("Manual mode - you will be prompted before applying changes");
     }
     println!("Press Ctrl+C to stop watching\n");
-    
+
     // Get machine's groups
     let groups_file = config.mfs_mount
         .join("machines")
@@ -1181,7 +1182,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
         .join("etc")
         .join("laszoo")
         .join("groups.conf");
-    
+
     let machine_groups: Vec<String> = if groups_file.exists() {
         std::fs::read_to_string(&groups_file)?
             .lines()
@@ -1191,7 +1192,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
     } else {
         Vec::new()
     };
-    
+
     // Filter groups based on command line argument
     let groups_to_watch = if let Some(group_name) = group {
         if machine_groups.contains(&group_name.to_string()) {
@@ -1203,30 +1204,30 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
     } else {
         machine_groups
     };
-    
+
     if groups_to_watch.is_empty() {
         println!("This machine is not in any groups. Nothing to watch.");
         return Ok(());
     }
-    
+
     // Collect all enrolled paths to watch from manifests
     let mut watch_paths = HashSet::new();
     let mut path_to_group_map = std::collections::HashMap::new();
     let mut enrolled_directories = HashSet::new();
     let mut enrolled_files = HashSet::new();
-    
+
     for group_name in &groups_to_watch {
         // Watch the group directory for new templates
         let group_dir = crate::fs::get_group_dir(&config.mfs_mount, "", group_name);
         watch_paths.insert(group_dir.clone());
         path_to_group_map.insert(group_dir, group_name.clone());
-        
+
         // Load both group and machine manifests
         if let Ok(group_manifest) = enrollment_manager.load_group_manifest(group_name) {
             for (path, entry) in &group_manifest.entries {
                 watch_paths.insert(path.clone());
                 path_to_group_map.insert(path.clone(), group_name.clone());
-                
+
                 if entry.checksum == "directory" {
                     enrolled_directories.insert(path.clone());
                 } else {
@@ -1234,13 +1235,13 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                 }
             }
         }
-        
+
         let machine_manifest = enrollment_manager.load_manifest()?;
         for (path, entry) in &machine_manifest.entries {
             if &entry.group == group_name {
                 watch_paths.insert(path.clone());
                 path_to_group_map.insert(path.clone(), group_name.clone());
-                
+
                 if entry.checksum == "directory" {
                     enrolled_directories.insert(path.clone());
                 } else {
@@ -1249,35 +1250,35 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
             }
         }
     }
-    
+
     if watch_paths.is_empty() {
         println!("No enrolled paths found in the specified group(s).");
         return Ok(());
     }
-    
-    println!("Watching {} paths ({} directories, {} files) across {} group(s):", 
+
+    println!("Watching {} paths ({} directories, {} files) across {} group(s):",
         watch_paths.len(), enrolled_directories.len(), enrolled_files.len(), groups_to_watch.len());
     for group in &groups_to_watch {
         println!("  • {}", group);
     }
     println!();
-    
+
     // Create a channel for file events
     let (tx, rx) = channel();
-    
+
     // Create a channel for completed commits
     let (commit_tx, commit_rx) = std::sync::mpsc::channel::<HashSet<PathBuf>>();
-    
+
     // Create a debounced watcher
     let mut watcher = notify::recommended_watcher(move |event: std::result::Result<Event, notify::Error>| {
         if let Ok(event) = event {
             let _ = tx.send(event);
         }
     })?;
-    
+
     // Watch enrolled paths
     let mut watched_count = 0;
-    
+
     // Watch directories recursively
     for dir in &enrolled_directories {
         if dir.exists() {
@@ -1291,7 +1292,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
             warn!("Enrolled directory does not exist: {:?}", dir);
         }
     }
-    
+
     // Watch individual files (and their parent directories non-recursively)
     let mut watched_file_dirs = HashSet::new();
     for file in &enrolled_files {
@@ -1311,7 +1312,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
             warn!("Enrolled file does not exist: {:?}", file);
         }
     }
-    
+
     // Also watch the MooseFS mount for template changes to commit
     let mfs_groups_dir = config.mfs_mount.join("groups");
     if mfs_groups_dir.exists() {
@@ -1321,37 +1322,37 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
             debug!("Watching MooseFS groups directory for template changes");
         }
     }
-    
+
     if watched_count == 0 {
         println!("Warning: No directories could be watched.");
     } else {
         println!("Successfully watching {} directories.", watched_count);
     }
-    
+
     // Initial scan for missing files if --hard is enabled
     if hard {
         println!("\nScanning enrolled directories for missing files...");
         let mut missing_files = Vec::new();
-        
+
         // For enrolled directories, scan templates and check if files exist
         for dir in &enrolled_directories {
             if let Some(group) = path_to_group_map.get(dir) {
                 let group_dir = crate::fs::get_group_dir(&config.mfs_mount, "", group);
-                
+
                 // Scan templates in this group directory
                 for entry in walkdir::WalkDir::new(&group_dir).into_iter().filter_map(|e| e.ok()) {
-                        if entry.file_type().is_file() && 
+                        if entry.file_type().is_file() &&
                            entry.path().extension() == Some(std::ffi::OsStr::new("lasz")) {
-                            
+
                             // Extract the original file path from template path
                             if let Ok(relative_path) = entry.path().strip_prefix(&group_dir) {
                                 let path_str = relative_path.to_string_lossy();
                                 if path_str.ends_with(".lasz") {
                                     // The relative path is like "tmp/test/file.txt.lasz", we need "/tmp/test/file.txt"
                                     let original_path = PathBuf::from("/").join(&path_str[..path_str.len() - 5]);
-                                    
+
                                     debug!("Checking template: {:?} -> original path: {:?}", entry.path(), original_path);
-                                    
+
                                     // Check if this file is within our enrolled directory
                                     if original_path.starts_with(dir) && !original_path.exists() {
                                         missing_files.push((original_path, group.clone(), entry.path().to_path_buf()));
@@ -1362,7 +1363,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                     }
             }
         }
-        
+
         // For enrolled files, check if they exist
         for file in &enrolled_files {
             if !file.exists() {
@@ -1374,16 +1375,16 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                 }
             }
         }
-        
+
         if !missing_files.is_empty() {
             println!("Found {} missing file(s):", missing_files.len());
             for (path, group, template_path) in &missing_files {
                 println!("  ✗ {} (group: {})", path.display(), group);
-                
+
                 // Load group configuration to get sync action
-                let (_before_trigger, _after_trigger, sync_action) = 
+                let (_before_trigger, _after_trigger, sync_action) =
                     load_group_config(&config.mfs_mount, group)?;
-                
+
                 // For converge with --hard, delete the template
                 if matches!(sync_action, SyncAction::Converge) {
                     if let Err(e) = std::fs::remove_file(template_path) {
@@ -1397,14 +1398,14 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                     }
                 }
             }
-            
+
             // Commit template deletions if any were made
             if config.auto_commit && !missing_files.is_empty() {
                 println!("\nScheduling background commit for template deletions...");
-                
+
                 // Clone config for background task
                 let config_clone = config.clone();
-                
+
                 // Spawn background commit task
                 tokio::spawn(async move {
                     if let Err(e) = commit_changes(&config_clone, Some("Removed templates for missing files"), true).await {
@@ -1416,7 +1417,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
             }
         }
     }
-    
+
     // Process events
     let mut debounce_buffer = HashSet::new();
     let mut template_changes = HashSet::new();
@@ -1433,7 +1434,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
     let mut known_templates: HashSet<PathBuf> = HashSet::new();
     let mut known_template_timestamps: std::collections::HashMap<PathBuf, std::time::SystemTime> = std::collections::HashMap::new();
     let mut known_template_checksums: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
-    
+
     // Initial scan of templates
     for group_name in &groups_to_watch {
         let group_dir = crate::fs::get_group_dir(&config.mfs_mount, "", group_name);
@@ -1442,14 +1443,14 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                 if entry.file_type().is_file() && entry.path().extension() == Some(std::ffi::OsStr::new("lasz")) {
                     let template_path = entry.path().to_path_buf();
                     known_templates.insert(template_path.clone());
-                    
+
                     // Record initial timestamp and checksum
                     if let Ok(metadata) = std::fs::metadata(&template_path) {
                         if let Ok(modified) = metadata.modified() {
                             known_template_timestamps.insert(template_path.clone(), modified);
                         }
                     }
-                    
+
                     // Calculate initial checksum
                     if let Ok(checksum) = calculate_file_checksum(&template_path) {
                         known_template_checksums.insert(template_path, checksum);
@@ -1458,7 +1459,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
             }
         }
     }
-    
+
     loop {
         // Check for completed commits (non-blocking)
         while let Ok(completed_changes) = commit_rx.try_recv() {
@@ -1474,7 +1475,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                 debug!("Cleaned up {} committed template changes", completed_changes.len());
             }
         }
-        
+
         // Check for events with timeout
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(event) => {
@@ -1482,7 +1483,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                     EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) => {
                         for path in event.paths {
                             // Check if it's a template change in MooseFS
-                            if path.starts_with(&mfs_groups_dir) && 
+                            if path.starts_with(&mfs_groups_dir) &&
                                (path.extension() == Some(std::ffi::OsStr::new("lasz")) ||
                                 path.extension() == Some(std::ffi::OsStr::new("json"))) {
                                 template_changes.insert(path);
@@ -1491,7 +1492,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                             // Check if it's a file we should track (including deleted files)
                             else {
                                 let mut should_track = false;
-                                
+
                                 // Check if it's an enrolled file
                                 if enrolled_files.contains(&path) {
                                     should_track = true;
@@ -1504,7 +1505,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                                         }
                                     }
                                 }
-                                
+
                                 if should_track {
                                     if ignore_file_changes.contains(&path) {
                                         debug!("Ignoring file change event for {:?} (template application in progress)", path);
@@ -1523,28 +1524,28 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Check if we should process debounced events
-                if !debounce_buffer.is_empty() && 
+                if !debounce_buffer.is_empty() &&
                    last_event_time.elapsed() > debounce_duration {
-                    
+
                     // Process the buffered changes
-                    println!("\n[{}] Changes detected in {} file(s):", 
+                    println!("\n[{}] Changes detected in {} file(s):",
                         chrono::Local::now().format("%H:%M:%S"),
                         debounce_buffer.len()
                     );
-                    
+
                     let mut affected_groups = HashSet::new();
                     let mut files_by_group: HashMap<String, Vec<PathBuf>> = HashMap::new();
-                    
+
                     for path in &debounce_buffer {
                         // Skip files that are currently being ignored (template applications)
                         if ignore_file_changes.contains(path) {
                             debug!("Skipping file change for {:?} (currently applying template)", path);
                             continue;
                         }
-                        
+
                         // Find which group this file belongs to
                         let mut found_group = None;
-                        
+
                         // Check if this is an enrolled file
                         if enrolled_files.contains(path) {
                             if let Some(group) = path_to_group_map.get(path) {
@@ -1561,13 +1562,13 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                                 }
                             }
                         }
-                        
+
                         if let Some(group) = found_group {
                             affected_groups.insert(group.clone());
                             files_by_group.entry(group.clone())
                                 .or_insert_with(Vec::new)
                                 .push(path.clone());
-                            
+
                             let status_char = if path.exists() {
                                 // Check if template exists
                                 let template_path = enrollment_manager.get_group_template_path(&group, path)?;
@@ -1582,7 +1583,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                             println!("  {} {} (group: {})", status_char, path.display(), group);
                         }
                     }
-                    
+
                     // Apply changes if auto mode is enabled or user confirms
                     let should_apply = if auto {
                         true
@@ -1590,21 +1591,21 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                         print!("\nApply changes? [y/N] ");
                         use std::io::{self, Write};
                         io::stdout().flush()?;
-                        
+
                         let mut input = String::new();
                         io::stdin().read_line(&mut input)?;
                         input.trim().to_lowercase() == "y"
                     };
-                    
+
                     if should_apply {
                         // Process changes for each affected group
                         for group_name in affected_groups {
                             // Load group configuration to get sync action
-                            let (_before_trigger, _after_trigger, sync_action) = 
+                            let (_before_trigger, _after_trigger, sync_action) =
                                 load_group_config(&config.mfs_mount, &group_name)?;
-                            
+
                             println!("\nProcessing group '{}' with sync action: {:?}", group_name, sync_action);
-                            
+
                             // Process each changed file in this group according to sync action
                             if let Some(files) = files_by_group.get(&group_name) {
                                 for path in files {
@@ -1618,7 +1619,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                                         Ok(template_changed) => {
                                             if template_changed {
                                                 println!("✓ Updated template for {}", path.display());
-                                                
+
                                                 // Track that this template change originated from local file change
                                                 let template_path = enrollment_manager.get_group_template_path(&group_name, path)?;
                                                 local_template_changes.insert(template_path);
@@ -1635,22 +1636,22 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                     } else {
                         println!("Changes not applied.");
                     }
-                    
+
                     // Clear the buffer
                     debounce_buffer.clear();
                     println!(); // Add blank line for readability
                 }
-                
+
                 // Check if we should process template changes
-                if !template_changes.is_empty() && 
+                if !template_changes.is_empty() &&
                    last_template_time.elapsed() > debounce_duration {
-                    
+
                     debug!("Template changes detected: {} files", template_changes.len());
-                    
+
                     // Only auto-commit template changes that originated from local file changes
                     if config.auto_commit && !local_template_changes.is_empty() {
                         println!("\nScheduling background commit for {} local template changes...", local_template_changes.len());
-                        
+
                         // Clone the changes being committed (excluding already committed ones)
                         let mut changes_to_commit = HashSet::new();
                         for change in &local_template_changes {
@@ -1658,18 +1659,18 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                                 changes_to_commit.insert(change.clone());
                             }
                         }
-                        
+
                         if !changes_to_commit.is_empty() {
                             // Mark these as being committed
                             for change in &changes_to_commit {
                                 committed_template_changes.insert(change.clone());
                             }
-                            
+
                             // Clone config and channel for background task
                             let config_clone = config.clone();
                             let commit_tx_clone = commit_tx.clone();
                             let changes_clone = changes_to_commit.clone();
-                            
+
                             // Spawn background commit task
                             tokio::spawn(async move {
                                 if let Err(e) = commit_changes(&config_clone, Some("Template changes from local file modifications"), true).await {
@@ -1684,28 +1685,28 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                             });
                         }
                     }
-                    
+
                     // Clear template_changes but keep local_template_changes for race condition handling
                     template_changes.clear();
                     // Don't clear local_template_changes - they'll be cleaned up when commits complete
                 }
-                
+
                 // Periodic template scanning for MooseFS (since inotify doesn't work)
                 if last_template_scan.elapsed() > template_scan_interval {
                     debug!("Performing periodic template scan...");
-                    
+
                     for group_name in &groups_to_watch {
                         let group_dir = crate::fs::get_group_dir(&config.mfs_mount, "", group_name);
-                        
+
                         for entry in walkdir::WalkDir::new(&group_dir) {
                             if let Ok(entry) = entry {
                                 if entry.file_type().is_file() && entry.path().extension() == Some(std::ffi::OsStr::new("lasz")) {
                                     let template_path = entry.path().to_path_buf();
-                                    
+
                                     // Check if this is a new template or if it has been modified
                                     let is_new = !known_templates.contains(&template_path);
                                     let mut is_modified = false;
-                                    
+
                                     if !is_new {
                                         // Check if content changed (using checksum)
                                         if let Ok(current_checksum) = calculate_file_checksum(&template_path) {
@@ -1721,7 +1722,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                                                 known_template_checksums.insert(template_path.clone(), current_checksum);
                                             }
                                         }
-                                        
+
                                         // Also update timestamp for reference
                                         if let Ok(metadata) = std::fs::metadata(&template_path) {
                                             if let Ok(modified) = metadata.modified() {
@@ -1733,46 +1734,46 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                                         if let Ok(checksum) = calculate_file_checksum(&template_path) {
                                             known_template_checksums.insert(template_path.clone(), checksum);
                                         }
-                                        
+
                                         if let Ok(metadata) = std::fs::metadata(&template_path) {
                                             if let Ok(modified) = metadata.modified() {
                                                 known_template_timestamps.insert(template_path.clone(), modified);
                                             }
                                         }
                                     }
-                                    
+
                                     if is_new || is_modified {
                                         // Extract the original file path from template path
                                         if let Ok(relative_path) = template_path.strip_prefix(&group_dir) {
                                             let path_str = relative_path.to_string_lossy();
                                             if path_str.ends_with(".lasz") {
                                                 let original_path = PathBuf::from("/").join(&path_str[..path_str.len() - 5]);
-                                                
+
                                                 // Check if this template change was triggered by a local file change
                                                 let was_local_change = local_file_changes.contains(&original_path);
-                                                
+
                                                 if is_new {
-                                                    println!("\n[{}] New template detected: {}", 
+                                                    println!("\n[{}] New template detected: {}",
                                                         chrono::Local::now().format("%H:%M:%S"),
                                                         template_path.display()
                                                     );
                                                 } else if is_modified {
-                                                    println!("\n[{}] Template modified: {}", 
+                                                    println!("\n[{}] Template modified: {}",
                                                         chrono::Local::now().format("%H:%M:%S"),
                                                         template_path.display()
                                                     );
                                                 }
-                                                
+
                                                 known_templates.insert(template_path.clone());
-                                                
+
                                                 // Only auto-apply if this wasn't a local change and auto mode is enabled
                                                 if !was_local_change && auto {
                                                     println!("  → Auto-applying template change from remote machine");
-                                                    
+
                                                     // Add to ignore list before applying
                                                     ignore_file_changes.insert(original_path.clone());
                                                     ignore_file_timestamps.insert(original_path.clone(), std::time::Instant::now());
-                                                    
+
                                                     // Apply this specific template
                                                     if let Err(e) = enrollment_manager.apply_single_template(&template_path, &original_path) {
                                                         error!("Failed to apply template {:?}: {}", template_path, e);
@@ -1785,7 +1786,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                                                 } else if !auto {
                                                     println!("  → Template change detected (manual mode - run 'laszoo apply {}' to apply)", group_name);
                                                 }
-                                                
+
                                                 template_changes.insert(template_path);
                                                 last_template_time = std::time::Instant::now();
                                             }
@@ -1795,28 +1796,28 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
                             }
                         }
                     }
-                    
+
                     // Clear local file changes that are older than template scan interval
                     // This prevents false positives where we think a template change was local
                     local_file_changes.clear();
-                    
+
                     // Clean up expired ignore entries (older than 5 seconds)
                     let ignore_timeout = Duration::from_secs(5);
                     let now = std::time::Instant::now();
                     let mut expired_ignores = Vec::new();
-                    
+
                     for (path, timestamp) in &ignore_file_timestamps {
                         if now.duration_since(*timestamp) > ignore_timeout {
                             expired_ignores.push(path.clone());
                         }
                     }
-                    
+
                     for path in expired_ignores {
                         ignore_file_changes.remove(&path);
                         ignore_file_timestamps.remove(&path);
                         debug!("Expired ignore for file: {:?}", path);
                     }
-                    
+
                     last_template_scan = std::time::Instant::now();
                 }
             }
@@ -1826,7 +1827,7 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -1839,11 +1840,11 @@ async fn handle_file_change(
     hard: bool,
 ) -> Result<bool> {
     use crate::template::TemplateEngine;
-    
+
     let template_path = enrollment_manager.get_group_template_path(group, file_path)?;
     let template_exists = template_path.exists();
     let file_exists = file_path.exists();
-    
+
     match (file_exists, template_exists, sync_action) {
         // File deleted locally
         (false, true, SyncAction::Converge) => {
@@ -1858,7 +1859,7 @@ async fn handle_file_change(
                 Ok(false)
             }
         },
-        
+
         // File deleted locally with rollback - restore from template
         (false, true, SyncAction::Rollback) => {
             // Apply template to restore file
@@ -1866,28 +1867,28 @@ async fn handle_file_change(
             println!("  Restored deleted file from template: {}", file_path.display());
             Ok(false)
         },
-        
+
         // File modified locally with converge - update template
         (true, true, SyncAction::Converge) => {
             // Read current file content
             let file_content = std::fs::read_to_string(file_path)?;
-            
+
             // Load template to preserve variables
             let template_content = std::fs::read_to_string(&template_path)?;
-            
+
             // Use template engine to merge changes while preserving variables
             let template_engine = TemplateEngine::new()?;
             let updated_template = template_engine.merge_file_changes_to_template(
                 &template_content,
                 &file_content,
             )?;
-            
+
             // Write updated template
             std::fs::write(&template_path, &updated_template)?;
             info!("Updated template with local changes: {:?}", template_path);
             Ok(true)
         },
-        
+
         // File modified locally with rollback - restore from template
         (true, true, SyncAction::Rollback) => {
             // Apply template to revert changes
@@ -1895,20 +1896,20 @@ async fn handle_file_change(
             println!("  Rolled back local changes from template: {}", file_path.display());
             Ok(false)
         },
-        
+
         // File modified with freeze - do nothing
         (true, true, SyncAction::Freeze) => {
             println!("  Frozen file, changes ignored: {}", file_path.display());
             Ok(false)
         },
-        
+
         // File modified with drift - track but don't sync
         (true, true, SyncAction::Drift) => {
             println!("  Drift allowed, changes tracked: {}", file_path.display());
             // TODO: Record drift in audit log
             Ok(false)
         },
-        
+
         // File exists but no template - could be new file or deleted template
         (true, false, _) => {
             // For new files in watched directories, don't delete them
@@ -1918,16 +1919,16 @@ async fn handle_file_change(
             println!("  ? New/unknown file: {}", file_path.display());
             Ok(false)
         },
-        
+
         // Both deleted - nothing to do
         (false, false, _) => Ok(false),
-        
+
         // New file created locally
         (true, false, SyncAction::Converge) => {
             // This is handled separately for new files in watched directories
             Ok(false)
         },
-        
+
         _ => Ok(false),
     }
 }
@@ -1935,7 +1936,7 @@ async fn handle_file_change(
 /// Load group configuration including triggers and sync action
 fn load_group_config(mfs_mount: &Path, group: &str) -> Result<(Option<String>, Option<String>, SyncAction)> {
     use serde::{Serialize, Deserialize};
-    
+
     #[derive(Serialize, Deserialize, Default)]
     struct GroupConfig {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1944,27 +1945,27 @@ fn load_group_config(mfs_mount: &Path, group: &str) -> Result<(Option<String>, O
         after_trigger: Option<String>,
         sync_action: String,
     }
-    
+
     let config_path = mfs_mount
         .join("groups")
         .join(group)
         .join("config.json");
-    
+
     if !config_path.exists() {
         // Default to converge if no config exists
         return Ok((None, None, SyncAction::Converge));
     }
-    
+
     let content = std::fs::read_to_string(&config_path)?;
     let config: GroupConfig = serde_json::from_str(&content)?;
-    
+
     let sync_action = match config.sync_action.as_str() {
         "rollback" => SyncAction::Rollback,
         "freeze" => SyncAction::Freeze,
         "drift" => SyncAction::Drift,
         _ => SyncAction::Converge,
     };
-    
+
     Ok((config.before_trigger, config.after_trigger, sync_action))
 }
 
@@ -1977,7 +1978,7 @@ fn store_group_config(
     action: &SyncAction,
 ) -> Result<()> {
     use serde::{Serialize, Deserialize};
-    
+
     #[derive(Serialize, Deserialize, Default)]
     struct GroupConfig {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1986,7 +1987,7 @@ fn store_group_config(
         after_trigger: Option<String>,
         sync_action: String,
     }
-    
+
     let config = GroupConfig {
         before_trigger: before.map(|s| s.to_string()),
         after_trigger: after.map(|s| s.to_string()),
@@ -1997,20 +1998,20 @@ fn store_group_config(
             SyncAction::Drift => "drift".to_string(),
         },
     };
-    
+
     let config_path = mfs_mount
         .join("groups")
         .join(group)
         .join("config.json");
-    
+
     // Ensure parent directory exists
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    
+
     let json = serde_json::to_string_pretty(&config)?;
     std::fs::write(&config_path, json)?;
-    
+
     info!("Stored group configuration for '{}'", group);
     if let Some(cmd) = before {
         info!("  Before trigger: {}", cmd);
@@ -2019,6 +2020,6 @@ fn store_group_config(
         info!("  After trigger: {}", cmd);
     }
     info!("  Sync action: {:?}", action);
-    
+
     Ok(())
 }
