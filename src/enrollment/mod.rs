@@ -143,6 +143,48 @@ impl EnrollmentManager {
         // First ensure this machine is in the group
         self.add_machine_to_group(group)?;
         
+        // Get absolute path
+        let abs_path = file_path.canonicalize()?;
+        
+        // Check if this file is within any already-enrolled directories
+        let group_manifest = self.load_group_manifest(group)?;
+        for (enrolled_path, entry) in &group_manifest.entries {
+            if entry.checksum == "directory" {
+                // Check if our file is within this directory
+                if abs_path.starts_with(enrolled_path) {
+                    // This file is within an enrolled directory, just create the template
+                    info!("File {:?} is within enrolled directory {:?}, adopting into directory", abs_path, enrolled_path);
+                    
+                    // Read file content
+                    let content = fs::read_to_string(&abs_path)?;
+                    
+                    // Create group template
+                    let group_template_path = crate::fs::get_group_template_path(
+                        &self.mfs_mount, 
+                        "", 
+                        group,
+                        &abs_path
+                    )?;
+                    
+                    // Ensure parent directory exists
+                    if let Some(parent) = group_template_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    
+                    // Create template
+                    fs::write(&group_template_path, &content)?;
+                    info!("Created group template at {:?}", group_template_path);
+                    
+                    // Copy metadata
+                    self.copy_metadata(&abs_path, &group_template_path)?;
+                    
+                    info!("Successfully adopted {:?} into enrolled directory '{:?}'", abs_path, enrolled_path);
+                    return Ok(());
+                }
+            }
+        }
+        
+        // Not within any enrolled directory, proceed with normal enrollment
         self.enroll_file_with_dir(file_path, group, force, machine_specific, hybrid, None)
     }
     

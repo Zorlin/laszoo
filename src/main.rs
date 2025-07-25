@@ -460,13 +460,43 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                     }
                     
                     println!("    {} {} ({})", status, dir_path.display(), status_parts.join(", "));
+                    
+                    // Always show new files that need adoption
+                    if new_count > 0 && dir_path.exists() && dir_path.is_dir() {
+                        if let Ok(entries) = std::fs::read_dir(dir_path) {
+                            let mut new_files: Vec<_> = entries.flatten()
+                                .filter_map(|e| {
+                                    let metadata = e.metadata().ok()?;
+                                    if metadata.is_file() {
+                                        let file_path = e.path();
+                                        // Check if template exists
+                                        let template_path = enrollment_manager.get_group_template_path(group_name, &file_path).ok()?;
+                                        if !template_path.exists() {
+                                            Some(file_path)
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            new_files.sort();
+                            
+                            for file_path in new_files {
+                                let relative_path = file_path.strip_prefix(dir_path)
+                                    .unwrap_or(&file_path);
+                                println!("      ? {}", relative_path.display());
+                            }
+                        }
+                    }
                 } else {
                     // Directory doesn't exist
                     println!("    ✗ {} (directory missing)", dir_path.display());
                 }
                 
                 if detailed {
-                    // Show individual files when in detailed mode
+                    // Show all files when in detailed mode
                     if dir_path.exists() && dir_path.is_dir() {
                         if let Ok(entries) = std::fs::read_dir(dir_path) {
                             let mut files: Vec<_> = entries.flatten()
@@ -1538,15 +1568,13 @@ async fn handle_file_change(
             Ok(false)
         },
         
-        // Template deleted but file exists
+        // File exists but no template - could be new file or deleted template
         (true, false, _) => {
-            if hard {
-                // Delete local file if --hard is specified
-                std::fs::remove_file(file_path)?;
-                println!("  Deleted local file (template was removed): {}", file_path.display());
-            } else {
-                println!("  Template missing for: {} (local file preserved)", file_path.display());
-            }
+            // For new files in watched directories, don't delete them
+            // They should remain as "? new/unknown" status
+            // Only delete if we can confirm the template was actually deleted
+            // For now, preserve the file and show it as new
+            println!("  ? New/unknown file: {}", file_path.display());
             Ok(false)
         },
         
