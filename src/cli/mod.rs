@@ -40,12 +40,35 @@ pub enum Commands {
         /// Include hidden files when enrolling directories
         #[arg(long)]
         include_hidden: bool,
+        
+        /// Create machine-specific enrollment
+        #[arg(short, long)]
+        machine: bool,
+        
+        /// Create hybrid enrollment (machine template provides values for group template)
+        #[arg(long, conflicts_with = "machine")]
+        hybrid: bool,
+        
+        /// Command to run before applying changes
+        #[arg(long, value_name = "COMMAND")]
+        before: Option<String>,
+        
+        /// Command to run after applying changes
+        #[arg(long, value_name = "COMMAND")]
+        after: Option<String>,
+        
+        /// Sync action: converge (default), rollback, freeze, or drift
+        #[arg(long, default_value = "converge")]
+        action: SyncAction,
     },
     
     /// Unenroll files from Laszoo management
     Unenroll {
+        /// Group name to unenroll files from (if provided without paths, unenrolls all files from group)
+        #[arg(required_unless_present = "paths")]
+        group: Option<String>,
+        
         /// Paths to files to unenroll
-        #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
     
@@ -62,10 +85,6 @@ pub enum Commands {
     
     /// Show status of enrolled files and synchronization
     Status {
-        /// Show status for specific group
-        #[arg(short, long)]
-        group: Option<String>,
-        
         /// Show detailed status information
         #[arg(short, long)]
         detailed: bool,
@@ -91,10 +110,19 @@ pub enum Commands {
         files: Vec<PathBuf>,
     },
     
-    /// Manage groups
+    /// Manage group membership
     Group {
+        /// Group name
+        name: String,
+        
         #[command(subcommand)]
         command: GroupCommands,
+    },
+    
+    /// List all groups
+    Groups {
+        #[command(subcommand)]
+        command: GroupsCommands,
     },
     
     /// Initialize Laszoo in current directory
@@ -114,6 +142,21 @@ pub enum Commands {
         #[arg(short, long)]
         all: bool,
     },
+    
+    /// Watch for file changes using filesystem events
+    Watch {
+        /// Specific group to watch (all groups if not specified)
+        #[arg(short, long)]
+        group: Option<String>,
+        
+        /// Debounce interval in seconds (deprecated, kept for compatibility)
+        #[arg(short, long, default_value = "1", hide = true)]
+        interval: u64,
+        
+        /// Apply changes automatically without prompting
+        #[arg(short, long)]
+        auto: bool,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -126,48 +169,49 @@ pub enum SyncStrategy {
     Forward,
 }
 
+#[derive(clap::ValueEnum, Clone, Debug, Default)]
+pub enum SyncAction {
+    /// Capture changes from local system and apply to template (default)
+    #[default]
+    Converge,
+    /// Rollback local changes to match template
+    Rollback,
+    /// Freeze local file, preventing further template updates
+    Freeze,
+    /// Allow drift but track differences for auditing
+    Drift,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum GroupCommands {
-    /// Create a new group
-    Create {
-        /// Name of the group to create
-        name: String,
-        
-        /// Description of the group
-        #[arg(short, long)]
-        description: Option<String>,
+    /// Add a machine to this group
+    Add {
+        /// Machine name to add (current machine if not specified)
+        machine: Option<String>,
     },
     
-    /// List all groups
+    /// Remove a machine from this group
+    Remove {
+        /// Machine name to remove (current machine if not specified)
+        machine: Option<String>,
+        
+        /// Keep the group even if it's empty
+        #[arg(long)]
+        keep: bool,
+    },
+    
+    /// List machines in this group
     List,
     
-    /// Delete a group
-    Delete {
-        /// Name of the group to delete
-        name: String,
-        
-        /// Force deletion even if group has enrolled files
-        #[arg(short, long)]
-        force: bool,
+    /// Rename this group
+    Rename {
+        /// New name for the group
+        new_name: String,
     },
-    
-    /// Add host to group
-    AddHost {
-        /// Group name
-        group: String,
-        
-        /// Host to add (current host if not specified)
-        #[arg(long)]
-        host: Option<String>,
-    },
-    
-    /// Remove host from group
-    RemoveHost {
-        /// Group name
-        group: String,
-        
-        /// Host to remove (current host if not specified)
-        #[arg(long)]
-        host: Option<String>,
-    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GroupsCommands {
+    /// List all groups
+    List,
 }

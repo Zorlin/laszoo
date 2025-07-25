@@ -163,3 +163,23 @@ pub fn get_group_template_path(mfs_mount: &Path, _laszoo_dir: &str, group_name: 
     template_path.set_file_name(format!("{}.lasz", current_name));
     Ok(template_path)
 }
+
+/// Calculate SHA256 checksum of a file
+pub fn calculate_file_checksum(path: &Path) -> Result<String> {
+    use sha2::{Sha256, Digest};
+    use std::io::Read;
+    
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 8192];
+    
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    
+    Ok(format!("{:x}", hasher.finalize()))
+}

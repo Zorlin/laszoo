@@ -274,8 +274,8 @@ impl SyncEngine {
                     "".to_string()
                 );
                 
-                // Re-enroll to update checksum
-                manager.enroll_file(&operation.file_path, &operation.group, true)?;
+                // Re-enroll to update checksum (not machine-specific, not hybrid)
+                manager.enroll_file(&operation.file_path, &operation.group, true, false, false)?;
             }
             SyncOperationType::Forward { local_content: _ } => {
                 info!("Forwarding {:?} to all hosts", operation.file_path);

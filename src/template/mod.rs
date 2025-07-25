@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use handlebars::Handlebars;
 use regex::Regex;
 use serde_json::Value;
-use tracing::{debug, warn};
+use tracing::debug;
 use crate::error::{LaszooError, Result};
 
 pub struct TemplateEngine {
@@ -17,7 +17,8 @@ impl TemplateEngine {
         handlebars.set_strict_mode(false);
         
         // Regex for quack tags: [[x content x]]
-        let quack_regex = Regex::new(r"\[\[x\s*(.*?)\s*x\]\]")
+        // Use [\s\S]*? to match any character including newlines (non-greedy)
+        let quack_regex = Regex::new(r"\[\[x\s*([\s\S]*?)\s*x\]\]")
             .map_err(|e| LaszooError::Template(format!("Invalid regex: {}", e)))?;
         
         Ok(Self {
@@ -166,8 +167,15 @@ pub fn process_handlebars(template_content: &str, hostname: &str) -> Result<Stri
     let mut vars = HashMap::new();
     vars.insert("hostname".to_string(), serde_json::json!(hostname));
     
-    // Add more system variables as needed
-    engine.process_template(template_content, &vars, false)
+    // First process the template to expand handlebars variables
+    let processed = engine.process_template(template_content, &vars, false)?;
+    
+    // Then handle quack tags - render them as their content (without the [[x x]] markers)
+    let final_content = engine.quack_regex.replace_all(&processed, |caps: &regex::Captures| {
+        caps.get(1).map_or("", |m| m.as_str()).trim().to_string()
+    }).to_string();
+    
+    Ok(final_content)
 }
 
 /// Process template with quack tags from machine-specific content
@@ -176,17 +184,32 @@ pub fn process_with_quacks(group_template: &str, machine_template: &str) -> Resu
     
     // Extract quack tags from machine template
     let machine_quacks = engine.extract_quack_tags(machine_template);
+    debug!("Machine template: {:?}", machine_template);
+    debug!("Extracted {} quack tags", machine_quacks.len());
+    for (i, tag) in machine_quacks.iter().enumerate() {
+        debug!("Quack tag {}: {:?}", i, tag.content);
+    }
     
     // Replace {{ quack }} placeholders in group template with machine-specific content
     let mut result = group_template.to_string();
     let quack_placeholder_regex = Regex::new(r"\{\{\s*quack\s*\}\}")?;
     
-    for (i, caps) in quack_placeholder_regex.find_iter(group_template).enumerate() {
+    // Collect all match ranges first to avoid issues with replacements
+    let placeholders: Vec<_> = quack_placeholder_regex.find_iter(&result)
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    
+    // Replace in reverse order to maintain correct positions
+    for (i, (start, end)) in placeholders.iter().enumerate().rev() {
         if let Some(quack_tag) = machine_quacks.get(i) {
-            result = result.replacen(caps.as_str(), &quack_tag.content, 1);
+            result.replace_range(*start..*end, &quack_tag.content);
+        } else {
+            // If no corresponding quack tag, replace with empty string
+            result.replace_range(*start..*end, "");
         }
     }
     
+    debug!("Final result: {:?}", result);
     Ok(result)
 }
 

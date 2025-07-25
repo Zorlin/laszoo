@@ -14,6 +14,10 @@ pub struct EnrollmentEntry {
     pub enrolled_at: chrono::DateTime<chrono::Utc>,
     pub last_synced: Option<chrono::DateTime<chrono::Utc>>,
     pub template_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_hybrid: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enrolled_directory: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -85,17 +89,30 @@ impl EnrollmentManager {
         crate::fs::get_machine_dir(&self.mfs_mount, "", &self.hostname)
             .join("manifest.json")
     }
+    
+    pub fn group_manifest_path(&self, group: &str) -> PathBuf {
+        crate::fs::get_group_dir(&self.mfs_mount, "", group)
+            .join("manifest.json")
+    }
 
     pub fn load_manifest(&self) -> Result<EnrollmentManifest> {
         EnrollmentManifest::load(&self.manifest_path())
+    }
+    
+    pub fn load_group_manifest(&self, group: &str) -> Result<EnrollmentManifest> {
+        EnrollmentManifest::load(&self.group_manifest_path(group))
     }
 
     pub fn save_manifest(&self, manifest: &EnrollmentManifest) -> Result<()> {
         manifest.save(&self.manifest_path())
     }
+    
+    pub fn save_group_manifest(&self, group: &str, manifest: &EnrollmentManifest) -> Result<()> {
+        manifest.save(&self.group_manifest_path(group))
+    }
 
     /// Enroll a file or directory into a group
-    pub fn enroll_path(&self, group: &str, path: Option<&Path>, force: bool) -> Result<()> {
+    pub fn enroll_path(&self, group: &str, path: Option<&Path>, force: bool, machine_specific: bool, hybrid: bool) -> Result<()> {
         // If no path specified, enroll the machine into the group
         if path.is_none() {
             return self.enroll_machine_to_group(group);
@@ -111,9 +128,9 @@ impl EnrollmentManager {
         }
 
         if path.is_file() {
-            self.enroll_file(path, group, force)
+            self.enroll_file(path, group, force, machine_specific, hybrid)
         } else if path.is_dir() {
-            self.enroll_directory(path, group, force)
+            self.enroll_directory(path, group, force, machine_specific, hybrid)
         } else {
             Err(LaszooError::InvalidPath { 
                 path: path.to_path_buf() 
@@ -122,7 +139,15 @@ impl EnrollmentManager {
     }
 
     /// Enroll a file into a group
-    pub fn enroll_file(&self, file_path: &Path, group: &str, force: bool) -> Result<()> {
+    pub fn enroll_file(&self, file_path: &Path, group: &str, force: bool, machine_specific: bool, hybrid: bool) -> Result<()> {
+        // First ensure this machine is in the group
+        self.add_machine_to_group(group)?;
+        
+        self.enroll_file_with_dir(file_path, group, force, machine_specific, hybrid, None)
+    }
+    
+    /// Enroll a file into a group with optional directory tracking
+    fn enroll_file_with_dir(&self, file_path: &Path, group: &str, force: bool, machine_specific: bool, hybrid: bool, enrolled_directory: Option<&Path>) -> Result<()> {
         // Check permissions
         if let Err(_) = fs::metadata(file_path) {
             return Err(LaszooError::PermissionDenied { 
@@ -133,74 +158,130 @@ impl EnrollmentManager {
         // Get absolute path
         let abs_path = file_path.canonicalize()?;
         
-        // Load manifest
-        let mut manifest = self.load_manifest()?;
-        
-        // Check if already enrolled
-        if let Some(existing) = manifest.is_enrolled(&abs_path) {
-            if !force {
-                return Err(LaszooError::AlreadyEnrolled {
-                    path: abs_path.clone(),
-                    group: existing.group.clone(),
-                });
-            }
-            info!("Force enrolling file that was in group '{}'", existing.group);
-        }
-
         // Calculate checksum
         let checksum = self.calculate_checksum(&abs_path)?;
         
         // Read file content
         let content = fs::read_to_string(&abs_path)?;
         
-        // Create/update group template
-        let group_template_path = crate::fs::get_group_template_path(
-            &self.mfs_mount, 
-            "", 
-            group,
-            &abs_path
-        )?;
-        
-        // Ensure parent directory exists
-        if let Some(parent) = group_template_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        
-        // If this is the first enrollment for this file in this group, create template
-        if !group_template_path.exists() {
-            fs::write(&group_template_path, &content)?;
-            info!("Created group template at {:?}", group_template_path);
+        if machine_specific || hybrid {
+            // Create machine-specific template
+            let mut machine_template_path = crate::fs::get_machine_file_path(
+                &self.mfs_mount,
+                "",
+                &self.hostname,
+                &abs_path
+            )?;
+            // Append .lasz to the full filename (preserving original extension)
+            let filename = machine_template_path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            machine_template_path.set_file_name(format!("{}.lasz", filename));
+            
+            // Ensure parent directory exists
+            if let Some(parent) = machine_template_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            
+            // Write machine-specific template
+            fs::write(&machine_template_path, &content)?;
+            info!("Created machine-specific template at {:?}", machine_template_path);
             
             // Copy metadata
-            self.copy_metadata(&abs_path, &group_template_path)?;
+            self.copy_metadata(&abs_path, &machine_template_path)?;
+            
+            // Load machine manifest and add entry
+            let mut machine_manifest = self.load_manifest()?;
+            
+            // For machine-specific enrollment, we always allow it to override
+            // Just warn if it was already enrolled
+            if let Some(existing) = machine_manifest.is_enrolled(&abs_path) {
+                info!("Overriding previous enrollment in group '{}'", existing.group);
+            }
+            
+            let machine_entry = EnrollmentEntry {
+                original_path: abs_path.clone(),
+                checksum: checksum.clone(),
+                group: group.to_string(),
+                enrolled_at: chrono::Utc::now(),
+                last_synced: None,
+                template_path: Some(machine_template_path),
+                is_hybrid: if hybrid { Some(true) } else { None },
+                enrolled_directory: enrolled_directory.map(|p| p.to_path_buf()),
+            };
+            
+            machine_manifest.add_entry(machine_entry);
+            self.save_manifest(&machine_manifest)?;
+            
+            info!("Successfully enrolled {:?} as machine-specific for group '{}'", abs_path, group);
+        } else {
+            // Create/update group template
+            let group_template_path = crate::fs::get_group_template_path(
+                &self.mfs_mount, 
+                "", 
+                group,
+                &abs_path
+            )?;
+            
+            // Ensure parent directory exists
+            if let Some(parent) = group_template_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            
+            // If this is the first enrollment for this file in this group, create template
+            if !group_template_path.exists() {
+                fs::write(&group_template_path, &content)?;
+                info!("Created group template at {:?}", group_template_path);
+                
+                // Copy metadata
+                self.copy_metadata(&abs_path, &group_template_path)?;
+            }
+            
+            // Load group manifest and add entry
+            let mut group_manifest = self.load_group_manifest(group)?;
+            
+            // Check if already enrolled in group manifest
+            if let Some(existing) = group_manifest.is_enrolled(&abs_path) {
+                if !force {
+                    return Err(LaszooError::AlreadyEnrolled {
+                        path: abs_path.clone(),
+                        group: existing.group.clone(),
+                    });
+                }
+                info!("Force enrolling file in group manifest");
+            }
+            
+            let group_entry = EnrollmentEntry {
+                original_path: abs_path.clone(),
+                checksum,
+                group: group.to_string(),
+                enrolled_at: chrono::Utc::now(),
+                last_synced: None,
+                template_path: Some(group_template_path),
+                is_hybrid: None,
+                enrolled_directory: enrolled_directory.map(|p| p.to_path_buf()),
+            };
+            
+            group_manifest.add_entry(group_entry);
+            self.save_group_manifest(group, &group_manifest)?;
+            
+            info!("Successfully enrolled {:?} into group '{}'", abs_path, group);
         }
         
-        // Create enrollment entry
-        let entry = EnrollmentEntry {
-            original_path: abs_path.clone(),
-            checksum,
-            group: group.to_string(),
-            enrolled_at: chrono::Utc::now(),
-            last_synced: None,
-            template_path: Some(group_template_path),
-        };
-        
-        // Add to manifest
-        manifest.add_entry(entry);
-        self.save_manifest(&manifest)?;
-        
-        info!("Successfully enrolled {:?} into group '{}'", abs_path, group);
         Ok(())
     }
 
     /// Enroll a directory recursively
-    fn enroll_directory(&self, dir_path: &Path, group: &str, force: bool) -> Result<()> {
+    fn enroll_directory(&self, dir_path: &Path, group: &str, force: bool, machine_specific: bool, hybrid: bool) -> Result<()> {
+        // First ensure this machine is in the group
+        self.add_machine_to_group(group)?;
+        
         let abs_path = dir_path.canonicalize()?;
         
         for entry in walkdir::WalkDir::new(&abs_path) {
             let entry = entry?;
             if entry.file_type().is_file() {
-                if let Err(e) = self.enroll_file(entry.path(), group, force) {
+                if let Err(e) = self.enroll_file_with_dir(entry.path(), group, force, machine_specific, hybrid, Some(&abs_path)) {
                     warn!("Failed to enroll {:?}: {}", entry.path(), e);
                 }
             }
@@ -213,16 +294,57 @@ impl EnrollmentManager {
     fn enroll_machine_to_group(&self, group: &str) -> Result<()> {
         info!("Enrolling machine {} into group {}", self.hostname, group);
         
-        // Check if group exists
-        let group_dir = crate::fs::get_group_dir(&self.mfs_mount, "", group);
-        if !group_dir.exists() {
-            return Err(LaszooError::GroupNotFound { 
-                name: group.to_string() 
-            });
-        }
+        // Add machine to group
+        self.add_machine_to_group(group)?;
         
         // Apply all templates from the group
         self.apply_group_templates(group)?;
+        
+        Ok(())
+    }
+    
+    /// Add this machine to a group (creates group if needed)
+    pub fn add_machine_to_group(&self, group: &str) -> Result<()> {
+        // Create group directory if it doesn't exist
+        let group_dir = crate::fs::get_group_dir(&self.mfs_mount, "", group);
+        if !group_dir.exists() {
+            fs::create_dir_all(&group_dir)?;
+            info!("Created new group '{}'", group);
+        }
+        
+        // Update machine's groups.conf
+        let groups_file = self.mfs_mount
+            .join("machines")
+            .join(&self.hostname)
+            .join("etc")
+            .join("laszoo")
+            .join("groups.conf");
+        
+        // Create directory if needed
+        if let Some(parent) = groups_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        
+        // Read existing groups
+        let mut groups: Vec<String> = if groups_file.exists() {
+            fs::read_to_string(&groups_file)?
+                .lines()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        
+        // Add group if not already present
+        if !groups.contains(&group.to_string()) {
+            groups.push(group.to_string());
+            groups.sort();
+            
+            // Write back
+            fs::write(&groups_file, groups.join("\n") + "\n")?;
+            info!("Added machine '{}' to group '{}'", self.hostname, group);
+        }
         
         Ok(())
     }
@@ -264,20 +386,42 @@ impl EnrollmentManager {
         // Read template content
         let template_content = fs::read_to_string(template_path)?;
         
-        // Check for machine-specific .lasz file
-        let machine_lasz_path = crate::fs::get_machine_file_path(
-            &self.mfs_mount,
-            "",
-            &self.hostname,
+        // Fix the machine-specific path - we need the relative path from root
+        let relative_path = if target_path.is_absolute() {
+            target_path.strip_prefix("/").unwrap_or(target_path)
+        } else {
             target_path
-        )?.with_extension("lasz");
+        };
+        
+        // Build the machine-specific template path - preserve original extension
+        let mut machine_lasz_path = crate::fs::get_machine_dir(&self.mfs_mount, "", &self.hostname)
+            .join(relative_path);
+        let current_name = machine_lasz_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        machine_lasz_path.set_file_name(format!("{}.lasz", current_name));
+        
+        // Check if this is a hybrid enrollment
+        let machine_manifest = self.load_manifest()?;
+        let is_hybrid = machine_manifest.is_enrolled(target_path)
+            .and_then(|e| e.is_hybrid)
+            .unwrap_or(false);
         
         // Process content based on whether machine-specific template exists
         let final_content = if machine_lasz_path.exists() {
+            info!("Using machine-specific template from {:?}", machine_lasz_path);
             let machine_content = fs::read_to_string(&machine_lasz_path)?;
-            crate::template::process_with_quacks(&template_content, &machine_content)?
+            
+            if is_hybrid {
+                info!("Processing in hybrid mode");
+                // In hybrid mode, use group template with machine template providing quack values
+                crate::template::process_with_quacks(&template_content, &machine_content)?
+            } else {
+                // Machine-specific template takes full precedence - just process it for quack tags
+                crate::template::process_handlebars(&machine_content, &self.hostname)?
+            }
         } else {
-            // Just process handlebars variables
+            // Just process handlebars variables and quack tags from group template
             crate::template::process_handlebars(&template_content, &self.hostname)?
         };
         
@@ -287,6 +431,8 @@ impl EnrollmentManager {
         }
         
         // Write the processed content
+        debug!("Writing content to {:?}, length: {}", target_path, final_content.len());
+        debug!("Content: {:?}", final_content);
         fs::write(target_path, &final_content)?;
         
         // Copy metadata from template
@@ -296,6 +442,15 @@ impl EnrollmentManager {
         let mut manifest = self.load_manifest()?;
         let checksum = self.calculate_checksum(target_path)?;
         
+        // Check group manifest to see if this file has enrolled_directory info
+        let enrolled_directory = if let Ok(group_manifest) = self.load_group_manifest(group) {
+            group_manifest.is_enrolled(target_path)
+                .and_then(|e| e.enrolled_directory.as_ref())
+                .map(|p| p.to_path_buf())
+        } else {
+            None
+        };
+        
         let entry = EnrollmentEntry {
             original_path: target_path.to_path_buf(),
             checksum,
@@ -303,6 +458,8 @@ impl EnrollmentManager {
             enrolled_at: chrono::Utc::now(),
             last_synced: Some(chrono::Utc::now()),
             template_path: Some(template_path.to_path_buf()),
+            is_hybrid: if is_hybrid { Some(true) } else { None },
+            enrolled_directory,
         };
         
         manifest.add_entry(entry);
@@ -340,9 +497,49 @@ impl EnrollmentManager {
     }
 
     pub fn check_file_status(&self, file_path: &Path) -> Result<Option<FileStatus>> {
-        let abs_path = file_path.canonicalize()?;
-        let manifest = self.load_manifest()?;
+        // First check if file exists
+        if !file_path.exists() {
+            // File is missing - but we need to check if it's enrolled
+            // Use the provided path as-is since we can't canonicalize a missing file
+            
+            // Check machine manifest
+            let manifest = self.load_manifest()?;
+            if manifest.is_enrolled(file_path).is_some() {
+                return Ok(None); // File is enrolled but missing
+            }
+            
+            // Check group manifests
+            let groups_file = self.mfs_mount
+                .join("machines")
+                .join(&self.hostname)
+                .join("etc")
+                .join("laszoo")
+                .join("groups.conf");
+            
+            if groups_file.exists() {
+                let groups: Vec<String> = fs::read_to_string(&groups_file)?
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                
+                for group in groups {
+                    if let Ok(group_manifest) = self.load_group_manifest(&group) {
+                        if group_manifest.is_enrolled(file_path).is_some() {
+                            return Ok(None); // File is enrolled but missing
+                        }
+                    }
+                }
+            }
+            
+            return Ok(None); // Not enrolled and doesn't exist
+        }
         
+        // File exists, check its status
+        let abs_path = file_path.canonicalize()?;
+        
+        // First check machine manifest
+        let manifest = self.load_manifest()?;
         if let Some(entry) = manifest.is_enrolled(&abs_path) {
             let current_checksum = self.calculate_checksum(&abs_path)?;
             let status = if current_checksum == entry.checksum {
@@ -350,10 +547,41 @@ impl EnrollmentManager {
             } else {
                 FileStatus::Modified
             };
-            Ok(Some(status))
-        } else {
-            Ok(None)
+            return Ok(Some(status));
         }
+        
+        // If not in machine manifest, check all group manifests
+        // Read machine's groups.conf to see which groups to check
+        let groups_file = self.mfs_mount
+            .join("machines")
+            .join(&self.hostname)
+            .join("etc")
+            .join("laszoo")
+            .join("groups.conf");
+        
+        if groups_file.exists() {
+            let groups: Vec<String> = fs::read_to_string(&groups_file)?
+                .lines()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            
+            for group in groups {
+                if let Ok(group_manifest) = self.load_group_manifest(&group) {
+                    if let Some(entry) = group_manifest.is_enrolled(&abs_path) {
+                        let current_checksum = self.calculate_checksum(&abs_path)?;
+                        let status = if current_checksum == entry.checksum {
+                            FileStatus::Unchanged
+                        } else {
+                            FileStatus::Modified
+                        };
+                        return Ok(Some(status));
+                    }
+                }
+            }
+        }
+        
+        Ok(None)
     }
 
     fn calculate_checksum(&self, path: &Path) -> Result<String> {
