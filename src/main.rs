@@ -344,28 +344,58 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
         config.mfs_mount.clone(),
         "".to_string()
     );
+    eprintln!("DEBUG: Created enrollment manager");
     
     println!("\nEnrolled Files by Group:");
     
     for group_name in &machine_groups {
         println!("\n  [{}]", group_name);
+        eprintln!("DEBUG: Processing group '{}'", group_name);
         
         // Load enrollments from both machine and group manifests
         let mut enrollments: HashMap<PathBuf, crate::enrollment::EnrollmentEntry> = HashMap::new();
         
         // Load from group manifest
-        if let Ok(group_manifest) = enrollment_manager.load_group_manifest(group_name) {
-            for (path, entry) in group_manifest.entries {
-                enrollments.insert(path, entry);
+        match enrollment_manager.load_group_manifest(group_name) {
+            Ok(group_manifest) => {
+                debug!("Loaded group manifest for '{}' with {} entries", group_name, group_manifest.entries.len());
+                eprintln!("DEBUG: Loaded group manifest for '{}' with {} entries", group_name, group_manifest.entries.len());
+                for (path, entry) in group_manifest.entries {
+                    debug!("  Group manifest entry: {} -> group: {}", path.display(), entry.group);
+                    eprintln!("DEBUG:   Group manifest entry: {} -> group: {}", path.display(), entry.group);
+                    enrollments.insert(path, entry);
+                }
+                debug!("After loading group manifest, enrollments has {} entries", enrollments.len());
+                eprintln!("DEBUG: After loading group manifest, enrollments has {} entries", enrollments.len());
+            }
+            Err(e) => {
+                debug!("Failed to load group manifest for '{}': {}", group_name, e);
+                eprintln!("DEBUG: Failed to load group manifest for '{}': {}", group_name, e);
             }
         }
         
         // Load from machine manifest (machine-specific enrollments)
-        let machine_manifest = enrollment_manager.load_manifest()?;
-        for (path, entry) in &machine_manifest.entries {
-            if &entry.group == group_name {
-                enrollments.insert(path.clone(), entry.clone());
+        match enrollment_manager.load_manifest() {
+            Ok(machine_manifest) => {
+                for (path, entry) in &machine_manifest.entries {
+                    if &entry.group == group_name {
+                        enrollments.insert(path.clone(), entry.clone());
+                    }
+                }
             }
+            Err(e) => {
+                debug!("Failed to load machine manifest: {}", e);
+                // This is OK - machine might not have any machine-specific enrollments
+            }
+        }
+        
+        debug!("Found {} enrollments for group '{}'", enrollments.len(), group_name);
+        eprintln!("DEBUG: Found {} enrollments for group '{}'", enrollments.len(), group_name);
+        
+        // Debug: write to file to bypass stderr capture issues
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/laszoo-debug.log") {
+            use std::io::Write;
+            writeln!(f, "Found {} enrollments for group '{}'", enrollments.len(), group_name).ok();
         }
         
         if enrollments.is_empty() {
@@ -377,7 +407,22 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
         let mut entries: Vec<_> = enrollments.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         
+        // Debug: write to file
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/laszoo-debug.log") {
+            use std::io::Write;
+            writeln!(f, "About to iterate over {} entries", entries.len()).ok();
+        }
+        
         for (path, entry) in entries {
+            // Debug: write to file
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/laszoo-debug.log") {
+                use std::io::Write;
+                writeln!(f, "Processing entry: {} (checksum: {})", path.display(), entry.checksum).ok();
+            }
+            
+            // Additional debug - print to stdout for testing
+            eprintln!("DEBUG STATUS: Processing entry: {} (checksum: {})", path.display(), entry.checksum);
+            
             // Check if this is a directory or file enrollment
             if entry.checksum == "directory" {
                 // Handle directory enrollment
@@ -605,6 +650,12 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                 
                 println!("    {} {}", status, file_path.display());
                 
+                // Debug: write to file
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/laszoo-debug.log") {
+                    use std::io::Write;
+                    writeln!(f, "Printed file: {} with status {}", file_path.display(), status).ok();
+                }
+                
                 if detailed {
                     if let Some(last_synced) = &entry.last_synced {
                         println!("      Last synced: {}", last_synced.format("%Y-%m-%d %H:%M:%S"));
@@ -619,6 +670,12 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                 }
                 }
             }
+        }
+        
+        // Debug: write to file
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/laszoo-debug.log") {
+            use std::io::Write;
+            writeln!(f, "Finished processing group '{}'", group_name).ok();
         }
     }
     

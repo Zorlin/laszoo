@@ -76,11 +76,52 @@ impl TestEnvironment {
     }
     
     pub fn run_laszoo(&self, args: &[&str]) -> Result<std::process::Output, Box<dyn std::error::Error>> {
-        let mut cmd = Command::new("./target/release/laszoo");
+        // Find the binary - when running tests, cargo sets CARGO_BIN_EXE_<name>
+        let binary_path = if let Ok(path) = std::env::var("CARGO_BIN_EXE_laszoo") {
+            PathBuf::from(path)
+        } else {
+            // Get the project root (where Cargo.toml is)
+            let mut current_dir = std::env::current_dir()?;
+            let mut project_root = None;
+            
+            // Search upward for Cargo.toml
+            loop {
+                if current_dir.join("Cargo.toml").exists() {
+                    project_root = Some(current_dir);
+                    break;
+                }
+                
+                if !current_dir.pop() {
+                    break;
+                }
+            }
+            
+            let root = project_root.ok_or("Could not find project root")?;
+            
+            // Check possible paths relative to project root
+            let possible_paths = [
+                root.join("target/release/laszoo"),
+                root.join("target/debug/laszoo"),
+            ];
+            
+            possible_paths.into_iter()
+                .find(|p| p.exists())
+                .ok_or("Could not find laszoo binary")?
+        };
+        
+        let mut cmd = Command::new(binary_path);
         
         // Set environment variables
         cmd.env("LASZOO_MFS_MOUNT", &self.mfs_mount);
         cmd.env("HOSTNAME", &self.hostname);
+        
+        // Pass through RUST_LOG if set
+        if let Ok(rust_log) = std::env::var("RUST_LOG") {
+            cmd.env("RUST_LOG", rust_log);
+        }
+        
+        // Set the working directory to the test directory
+        cmd.current_dir(&self.test_dir);
         
         // Add arguments
         cmd.args(args);
