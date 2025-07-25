@@ -59,8 +59,9 @@ fn test_full_workflow_single_machine() {
     // Check if the group is shown
     assert!(status_str.contains("webservers"), "Status should show webservers group");
     
-    // TODO: Status command is not showing individual files - this needs to be fixed
-    // For now, skip checking for individual files
+    // Check that individual files are shown
+    assert!(status_str.contains("nginx.conf"), "Status should show nginx.conf file");
+    assert!(status_str.contains("config.json"), "Status should show config.json file");
     
     // 4. Modify a file
     std::fs::write(&nginx_conf, "server {{ hostname }}\nport 8080").unwrap();

@@ -136,7 +136,7 @@ packages.conf simply contains the following:
 `^package-to-be-upgraded` - You can specify ^ to automatically upgrade a package on all systems in the group, optionally restarting or reloading a service after upgrade.
 
 The syntax for specifying post-actions could be something like:
-`^nginx!!upgrade=systemctl restart nginx`
+`^nginx --upgrade=systemctl restart nginx`
 
 `+package-to-be-installed` - You can specify + to make sure a package is installed on all systems in the group.
 
