@@ -51,6 +51,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 dirs = "5.0"
 gethostname = "0.5"
+libc = "0.2"
 
 [dev-dependencies]
 # For testing

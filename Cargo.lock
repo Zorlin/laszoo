@@ -1006,6 +1006,7 @@ dependencies = [
  "gethostname",
  "git2",
  "handlebars",
+ "libc",
  "notify",
  "regex",
  "reqwest",

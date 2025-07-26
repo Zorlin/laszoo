@@ -11,3 +11,4 @@ pub mod git;
 pub mod group;
 pub mod package;
 pub mod action;
+pub mod service;

@@ -193,6 +193,36 @@ pub enum Commands {
         #[arg(long)]
         rolling: bool,
     },
+    
+    /// Manage Laszoo as a system service
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ServiceCommands {
+    /// Install Laszoo as a systemd service
+    Install {
+        /// Enable hard mode (propagate deletions)
+        #[arg(long)]
+        hard: bool,
+        
+        /// User to run service as
+        #[arg(long, default_value = "root")]
+        user: String,
+        
+        /// Additional arguments to pass to laszoo watch
+        #[arg(long)]
+        extra_args: Option<String>,
+    },
+    
+    /// Uninstall the Laszoo systemd service
+    Uninstall,
+    
+    /// Show status of the Laszoo service
+    Status,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]

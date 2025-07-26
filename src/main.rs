@@ -11,6 +11,7 @@ mod git;
 mod group;
 mod package;
 mod action;
+mod service;
 
 use clap::Parser;
 use tracing::{info, error, debug, warn};
@@ -78,6 +79,9 @@ async fn main() -> Result<()> {
         }
         Commands::Patch { group, before, after, rolling } => {
             patch_group(&config, &group, before.as_deref(), after.as_deref(), rolling).await?;
+        }
+        Commands::Service { command } => {
+            handle_service_command(command).await?;
         }
     }
 
@@ -1187,6 +1191,79 @@ async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64,
 
     info!("Starting watch mode for group: {:?}, auto: {}", group, auto);
 
+    // Main watch loop that handles filesystem availability
+    loop {
+        // Check if filesystem is mounted
+        if !is_filesystem_mounted(&config.mfs_mount) {
+            println!("Warning: {} is not mounted. Waiting for filesystem to become available...", config.mfs_mount.display());
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            continue;
+        }
+
+        // Try to watch, but handle filesystem becoming unavailable
+        match watch_with_recovery(config, group, auto, hard).await {
+            Ok(_) => {
+                // Watch exited normally (e.g., Ctrl-C)
+                break;
+            }
+            Err(e) => {
+                // Check if it's a filesystem error
+                if is_filesystem_error(&e) {
+                    println!("Filesystem became unavailable: {}. Retrying in 30 seconds...", e);
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    continue;
+                } else {
+                    // Other error, propagate it
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_filesystem_mounted(path: &Path) -> bool {
+    // Use mountpoint command to check if path is mounted
+    match std::process::Command::new("mountpoint")
+        .arg("-q")
+        .arg(path)
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(_) => {
+            // If mountpoint command fails, fall back to checking if directory exists and is accessible
+            path.exists() && path.read_dir().is_ok()
+        }
+    }
+}
+
+fn is_filesystem_error(error: &LaszooError) -> bool {
+    match error {
+        LaszooError::Io(e) => {
+            // Check for common filesystem unavailability errors
+            matches!(e.kind(), 
+                std::io::ErrorKind::NotFound |
+                std::io::ErrorKind::PermissionDenied |
+                std::io::ErrorKind::Other
+            )
+        }
+        LaszooError::Other(msg) => {
+            msg.contains("filesystem") || 
+            msg.contains("mount") ||
+            msg.contains("not available") ||
+            msg.contains("Input/output error")
+        }
+        _ => false,
+    }
+}
+
+async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, hard: bool) -> Result<()> {
+    use notify::{Watcher, RecursiveMode, Event, EventKind};
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+    use std::collections::HashSet;
+
     let hostname = gethostname::gethostname().to_string_lossy().to_string();
     let enrollment_manager = crate::enrollment::EnrollmentManager::new(
         config.mfs_mount.clone(),
@@ -2235,6 +2312,27 @@ async fn patch_group(config: &Config, group: &str, before: Option<&str>, after: 
     }
     
     println!("Successfully patched system for group '{}'", group);
+    
+    Ok(())
+}
+
+async fn handle_service_command(command: crate::cli::ServiceCommands) -> Result<()> {
+    use crate::cli::ServiceCommands;
+    use crate::service::ServiceManager;
+    
+    let service_manager = ServiceManager::new()?;
+    
+    match command {
+        ServiceCommands::Install { hard, user, extra_args } => {
+            service_manager.install(hard, &user, extra_args.as_deref())?;
+        }
+        ServiceCommands::Uninstall => {
+            service_manager.uninstall()?;
+        }
+        ServiceCommands::Status => {
+            service_manager.status()?;
+        }
+    }
     
     Ok(())
 }
