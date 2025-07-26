@@ -2,8 +2,17 @@
   "permissions": {
     "allow": [
       "Bash(cargo build:*)",
-      "Bash(mkdir:*)"
+      "Bash(mkdir:*)",
+      "Bash(rustup target:*)",
+      "Bash(ls:*)",
+      "Bash(ldd:*)",
+      "Bash(chmod:*)"
     ],
     "deny": []
-  }
+  },
+  "enabledMcpjsonServers": [
+    "plane",
+    "playwright",
+    "deepwiki"
+  ]
 }

@@ -238,10 +238,25 @@ pub struct GamepadStatus {
     pub axes: Vec<f32>,
 }
 
+#[cfg(feature = "gamepad")]
 pub async fn gamepad_status(
     State(_state): State<AppState>,
 ) -> impl IntoResponse {
     // Get gamepad status from the gamepad module
     let status = crate::webui::gamepad::get_gamepad_status();
+    Json(ApiResponse::success(status))
+}
+
+#[cfg(not(feature = "gamepad"))]
+pub async fn gamepad_status(
+    State(_state): State<AppState>,
+) -> impl IntoResponse {
+    // Return empty gamepad status when feature is disabled
+    let status = GamepadStatus {
+        connected: false,
+        name: None,
+        buttons: vec![],
+        axes: vec![],
+    };
     Json(ApiResponse::success(status))
 }

@@ -1,5 +1,6 @@
 pub mod server;
 pub mod handlers;
+#[cfg(feature = "gamepad")]
 pub mod gamepad;
 pub mod websocket;
 
