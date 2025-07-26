@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
 use tracing::{info, warn, error, debug};
 use serde::{Serialize, Deserialize};
+use chrono::{DateTime, Utc};
 
 use crate::error::{Result, LaszooError};
 
@@ -10,7 +11,9 @@ use crate::error::{Result, LaszooError};
 pub enum PackageOperation {
     /// ^package - Upgrade package
     Upgrade { name: String, post_action: Option<String> },
-    /// ++upgrade - Upgrade all packages with start/end actions
+    /// ++update - Update package lists with before/after actions
+    UpdateAll { start_action: Option<String>, end_action: Option<String> },
+    /// ++upgrade - Upgrade all packages with before/after actions
     UpgradeAll { start_action: Option<String>, end_action: Option<String> },
     /// +package - Install package
     Install { name: String },
@@ -22,6 +25,18 @@ pub enum PackageOperation {
     Purge { name: String },
 }
 
+/// Action record for tracking all operations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionRecord {
+    pub timestamp: DateTime<Utc>,
+    pub hostname: String,
+    pub action_type: String,  // "package_install", "package_update", "package_upgrade", etc.
+    pub target: String,       // Package name or command
+    pub group: Option<String>,
+    pub status: String,       // "started", "completed", "failed"
+    pub details: Option<String>,
+}
+
 /// Package manager for handling package operations
 pub struct PackageManager {
     mfs_mount: PathBuf,
@@ -30,6 +45,84 @@ pub struct PackageManager {
 impl PackageManager {
     pub fn new(mfs_mount: PathBuf) -> Self {
         Self { mfs_mount }
+    }
+    
+    /// Record an action to the actions database
+    pub fn record_action(&self, action: &ActionRecord) -> Result<()> {
+        let hostname = gethostname::gethostname()
+            .to_string_lossy()
+            .to_string();
+            
+        // Create actions directory if it doesn't exist
+        let actions_dir = self.mfs_mount.join("actions");
+        std::fs::create_dir_all(&actions_dir)?;
+        
+        // Create hostname-specific directory
+        let host_actions_dir = actions_dir.join(&hostname);
+        std::fs::create_dir_all(&host_actions_dir)?;
+        
+        // Create filename with timestamp
+        let filename = format!("{}-{}.json", 
+            action.timestamp.format("%Y%m%d-%H%M%S"),
+            action.action_type
+        );
+        
+        let action_file = host_actions_dir.join(filename);
+        let json = serde_json::to_string_pretty(action)?;
+        std::fs::write(action_file, json)?;
+        
+        Ok(())
+    }
+    
+    /// Get command history for status display
+    pub fn get_command_history(&self, group: &str) -> Result<Vec<(String, Option<DateTime<Utc>>, Option<DateTime<Utc>>)>> {
+        let hostname = gethostname::gethostname()
+            .to_string_lossy()
+            .to_string();
+            
+        let actions_dir = self.mfs_mount.join("actions").join(&hostname);
+        let mut command_history: HashMap<String, (Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = HashMap::new();
+        
+        if !actions_dir.exists() {
+            return Ok(Vec::new());
+        }
+        
+        // Read all action files
+        for entry in std::fs::read_dir(&actions_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.extension() == Some(std::ffi::OsStr::new("json")) {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(action) = serde_json::from_str::<ActionRecord>(&content) {
+                        if action.group.as_ref() == Some(&group.to_string()) {
+                            if action.target == "++update" || action.target == "++upgrade" {
+                                let entry = command_history.entry(action.target.clone()).or_insert((None, None));
+                                
+                                // Track first seen (added) and last executed
+                                if entry.0.is_none() || action.timestamp < entry.0.unwrap() {
+                                    entry.0 = Some(action.timestamp);
+                                }
+                                
+                                if action.status == "completed" {
+                                    if entry.1.is_none() || action.timestamp > entry.1.unwrap() {
+                                        entry.1 = Some(action.timestamp);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Convert to vec for display
+        let mut result: Vec<_> = command_history.into_iter()
+            .map(|(cmd, (added, executed))| (cmd, added, executed))
+            .collect();
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        
+        Ok(result)
     }
 
     /// Get the packages.conf path for a group
@@ -74,17 +167,17 @@ impl PackageManager {
 
     /// Parse a single package line
     fn parse_package_line(&self, line: &str) -> Result<Option<PackageOperation>> {
-        // Handle upgrade all: ++upgrade or ++upgrade --start cmd --end cmd
-        if line.starts_with("++upgrade") {
+        // Handle update all: ++update or ++update --before cmd --after cmd
+        if line.starts_with("++update") {
             let mut start_action = None;
             let mut end_action = None;
             
-            // Parse --start and --end flags
-            if line.contains("--start") || line.contains("--end") {
+            // Parse --before and --after flags
+            if line.contains("--before") || line.contains("--after") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 let mut i = 0;
                 while i < parts.len() {
-                    if parts[i] == "--start" && i + 1 < parts.len() {
+                    if parts[i] == "--before" && i + 1 < parts.len() {
                         // Collect all parts until next flag or end
                         let mut cmd_parts = vec![];
                         i += 1;
@@ -93,7 +186,44 @@ impl PackageManager {
                             i += 1;
                         }
                         start_action = Some(cmd_parts.join(" "));
-                    } else if parts[i] == "--end" && i + 1 < parts.len() {
+                    } else if parts[i] == "--after" && i + 1 < parts.len() {
+                        // Collect all parts until next flag or end
+                        let mut cmd_parts = vec![];
+                        i += 1;
+                        while i < parts.len() && !parts[i].starts_with("--") {
+                            cmd_parts.push(parts[i]);
+                            i += 1;
+                        }
+                        end_action = Some(cmd_parts.join(" "));
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            
+            return Ok(Some(PackageOperation::UpdateAll { start_action, end_action }));
+        }
+        
+        // Handle upgrade all: ++upgrade or ++upgrade --before cmd --after cmd
+        if line.starts_with("++upgrade") {
+            let mut start_action = None;
+            let mut end_action = None;
+            
+            // Parse --before and --after flags
+            if line.contains("--before") || line.contains("--after") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                let mut i = 0;
+                while i < parts.len() {
+                    if parts[i] == "--before" && i + 1 < parts.len() {
+                        // Collect all parts until next flag or end
+                        let mut cmd_parts = vec![];
+                        i += 1;
+                        while i < parts.len() && !parts[i].starts_with("--") {
+                            cmd_parts.push(parts[i]);
+                            i += 1;
+                        }
+                        start_action = Some(cmd_parts.join(" "));
+                    } else if parts[i] == "--after" && i + 1 < parts.len() {
                         // Collect all parts until next flag or end
                         let mut cmd_parts = vec![];
                         i += 1;
@@ -163,8 +293,9 @@ impl PackageManager {
             // Add to map
             for op in group_ops {
                 match &op {
+                    PackageOperation::UpdateAll { .. } |
                     PackageOperation::UpgradeAll { .. } => {
-                        // UpgradeAll is a special operation that doesn't have a package name
+                        // UpdateAll and UpgradeAll are special operations that don't have a package name
                         operations.push(op);
                     }
                     _ => {
@@ -174,6 +305,7 @@ impl PackageManager {
                             PackageOperation::Keep { name } => name,
                             PackageOperation::Remove { name } => name,
                             PackageOperation::Purge { name } => name,
+                            PackageOperation::UpdateAll { .. } => unreachable!(),
                             PackageOperation::UpgradeAll { .. } => unreachable!(),
                         };
                         operation_map.insert(name.clone(), op);
@@ -193,8 +325,9 @@ impl PackageManager {
                 // Override group operations
                 for op in machine_ops {
                     match &op {
+                        PackageOperation::UpdateAll { .. } |
                         PackageOperation::UpgradeAll { .. } => {
-                            // UpgradeAll is a special operation that doesn't have a package name
+                            // UpdateAll and UpgradeAll are special operations that don't have a package name
                             operations.push(op);
                         }
                         _ => {
@@ -204,6 +337,7 @@ impl PackageManager {
                                 PackageOperation::Keep { name } => name,
                                 PackageOperation::Remove { name } => name,
                                 PackageOperation::Purge { name } => name,
+                                PackageOperation::UpdateAll { .. } => unreachable!(),
                                 PackageOperation::UpgradeAll { .. } => unreachable!(),
                             };
                             operation_map.insert(name.clone(), op);
@@ -243,6 +377,7 @@ impl PackageManager {
                 PackageOperation::Keep { name } => Some(name.clone()),
                 PackageOperation::Remove { name } => Some(name.clone()),
                 PackageOperation::Purge { name } => Some(name.clone()),
+                PackageOperation::UpdateAll { .. } => None, // UpdateAll doesn't have a package name
                 PackageOperation::UpgradeAll { .. } => None, // UpgradeAll doesn't have a package name
             }
         }).collect();
@@ -293,13 +428,23 @@ impl PackageManager {
                         content.push_str(&format!("^{}\n", name));
                     }
                 }
+                PackageOperation::UpdateAll { start_action, end_action } => {
+                    let mut line = String::from("++update");
+                    if let Some(start) = start_action {
+                        line.push_str(&format!(" --before {}", start));
+                    }
+                    if let Some(end) = end_action {
+                        line.push_str(&format!(" --after {}", end));
+                    }
+                    content.push_str(&format!("{}\n", line));
+                }
                 PackageOperation::UpgradeAll { start_action, end_action } => {
                     let mut line = String::from("++upgrade");
                     if let Some(start) = start_action {
-                        line.push_str(&format!(" --start {}", start));
+                        line.push_str(&format!(" --before {}", start));
                     }
                     if let Some(end) = end_action {
-                        line.push_str(&format!(" --end {}", end));
+                        line.push_str(&format!(" --after {}", end));
                     }
                     content.push_str(&format!("{}\n", line));
                 }
@@ -324,27 +469,16 @@ impl PackageManager {
 
     /// Detect the package manager on the current system
     pub fn detect_package_manager() -> Result<PackageManagerType> {
-        // Check for various package managers
-        if std::path::Path::new("/usr/bin/apt-get").exists() {
-            Ok(PackageManagerType::Apt)
-        } else if std::path::Path::new("/usr/bin/yum").exists() {
-            Ok(PackageManagerType::Yum)
-        } else if std::path::Path::new("/usr/bin/dnf").exists() {
-            Ok(PackageManagerType::Dnf)
-        } else if std::path::Path::new("/usr/bin/pacman").exists() {
-            Ok(PackageManagerType::Pacman)
-        } else if std::path::Path::new("/usr/bin/zypper").exists() {
-            Ok(PackageManagerType::Zypper)
-        } else if std::path::Path::new("/usr/bin/apk").exists() {
-            Ok(PackageManagerType::Apk)
-        } else {
-            Err(LaszooError::Other("No supported package manager found".to_string()))
-        }
+        detect_package_manager()
+            .ok_or_else(|| LaszooError::Other("No supported package manager found".to_string()))
     }
 
-    /// Apply package operations on the local system
-    pub async fn apply_operations(&self, operations: &[PackageOperation]) -> Result<()> {
+    /// Apply package operations on the local system with group context
+    pub async fn apply_operations_with_group(&self, operations: &[PackageOperation], group: Option<&str>) -> Result<()> {
         let pkg_mgr = Self::detect_package_manager()?;
+        let hostname = gethostname::gethostname()
+            .to_string_lossy()
+            .to_string();
         
         for op in operations {
             match op {
@@ -361,14 +495,108 @@ impl PackageManager {
                         self.run_command(action).await?;
                     }
                 }
+                PackageOperation::UpdateAll { start_action, end_action } => {
+                    // Record action start
+                    let action_record = ActionRecord {
+                        timestamp: Utc::now(),
+                        hostname: hostname.clone(),
+                        action_type: "package_update_all".to_string(),
+                        target: "++update".to_string(),
+                        group: group.map(|s| s.to_string()),
+                        status: "started".to_string(),
+                        details: None,
+                    };
+                    let _ = self.record_action(&action_record);
+                    
+                    if let Some(action) = start_action {
+                        info!("Running pre-update action: {}", action);
+                        self.run_command(action).await?;
+                    }
+                    
+                    info!("Updating package lists");
+                    match self.system_update(&pkg_mgr).await {
+                        Ok(_) => {
+                            // Record success
+                            let action_record = ActionRecord {
+                                timestamp: Utc::now(),
+                                hostname: hostname.clone(),
+                                action_type: "package_update_all".to_string(),
+                                target: "++update".to_string(),
+                                group: group.map(|s| s.to_string()),
+                                status: "completed".to_string(),
+                                details: None,
+                            };
+                            let _ = self.record_action(&action_record);
+                        }
+                        Err(e) => {
+                            // Record failure
+                            let action_record = ActionRecord {
+                                timestamp: Utc::now(),
+                                hostname: hostname.clone(),
+                                action_type: "package_update_all".to_string(),
+                                target: "++update".to_string(),
+                                group: group.map(|s| s.to_string()),
+                                status: "failed".to_string(),
+                                details: Some(format!("Error: {}", e)),
+                            };
+                            let _ = self.record_action(&action_record);
+                            return Err(e);
+                        }
+                    }
+                    
+                    if let Some(action) = end_action {
+                        info!("Running post-update action: {}", action);
+                        self.run_command(action).await?;
+                    }
+                }
                 PackageOperation::UpgradeAll { start_action, end_action } => {
+                    // Record action start
+                    let action_record = ActionRecord {
+                        timestamp: Utc::now(),
+                        hostname: hostname.clone(),
+                        action_type: "package_upgrade_all".to_string(),
+                        target: "++upgrade".to_string(),
+                        group: group.map(|s| s.to_string()),
+                        status: "started".to_string(),
+                        details: None,
+                    };
+                    let _ = self.record_action(&action_record);
+                    
                     if let Some(action) = start_action {
                         info!("Running pre-upgrade action: {}", action);
                         self.run_command(action).await?;
                     }
                     
                     info!("Upgrading all packages");
-                    self.system_upgrade(&pkg_mgr).await?;
+                    match self.system_upgrade(&pkg_mgr).await {
+                        Ok(_) => {
+                            // Record success
+                            let action_record = ActionRecord {
+                                timestamp: Utc::now(),
+                                hostname: hostname.clone(),
+                                action_type: "package_upgrade_all".to_string(),
+                                target: "++upgrade".to_string(),
+                                group: group.map(|s| s.to_string()),
+                                status: "completed".to_string(),
+                                details: None,
+                            };
+                            let _ = self.record_action(&action_record);
+                        }
+                        Err(e) => {
+                            // Record failure
+                            let action_record = ActionRecord {
+                                timestamp: Utc::now(),
+                                hostname: hostname.clone(),
+                                action_type: "package_upgrade_all".to_string(),
+                                target: "++upgrade".to_string(),
+                                group: group.map(|s| s.to_string()),
+                                status: "failed".to_string(),
+                                details: Some(format!("Error: {}", e)),
+                            };
+                            let _ = self.record_action(&action_record);
+                            return Err(e);
+                        }
+                    }
                     
                     if let Some(action) = end_action {
                         info!("Running post-upgrade action: {}", action);
@@ -390,6 +618,11 @@ impl PackageManager {
         }
 
         Ok(())
+    }
+    
+    /// Apply package operations on the local system (without group context)
+    pub async fn apply_operations(&self, operations: &[PackageOperation]) -> Result<()> {
+        self.apply_operations_with_group(operations, None).await
     }
 
     /// Install a package using the appropriate package manager
@@ -448,6 +681,20 @@ impl PackageManager {
         self.run_command(&cmd).await
     }
 
+    /// Run a system update (refresh package lists)
+    pub async fn system_update(&self, pkg_mgr: &PackageManagerType) -> Result<()> {
+        let cmd = match pkg_mgr {
+            PackageManagerType::Apt => "apt-get update",
+            PackageManagerType::Yum => "yum check-update || true", // check-update returns 100 if updates available
+            PackageManagerType::Dnf => "dnf check-update || true", // check-update returns 100 if updates available
+            PackageManagerType::Pacman => "pacman -Sy",
+            PackageManagerType::Zypper => "zypper refresh",
+            PackageManagerType::Apk => "apk update",
+        };
+
+        self.run_command(cmd).await
+    }
+
     /// Run a system upgrade
     pub async fn system_upgrade(&self, pkg_mgr: &PackageManagerType) -> Result<()> {
         let cmd = match pkg_mgr {
@@ -492,4 +739,24 @@ pub enum PackageManagerType {
     Pacman,
     Zypper,
     Apk,
+}
+
+/// Detect the package manager on the current system (returns Option)
+pub fn detect_package_manager() -> Option<PackageManagerType> {
+    // Check for various package managers
+    if std::path::Path::new("/usr/bin/apt-get").exists() {
+        Some(PackageManagerType::Apt)
+    } else if std::path::Path::new("/usr/bin/yum").exists() {
+        Some(PackageManagerType::Yum)
+    } else if std::path::Path::new("/usr/bin/dnf").exists() {
+        Some(PackageManagerType::Dnf)
+    } else if std::path::Path::new("/usr/bin/pacman").exists() {
+        Some(PackageManagerType::Pacman)
+    } else if std::path::Path::new("/usr/bin/zypper").exists() {
+        Some(PackageManagerType::Zypper)
+    } else if std::path::Path::new("/usr/bin/apk").exists() || std::path::Path::new("/sbin/apk").exists() {
+        Some(PackageManagerType::Apk)
+    } else {
+        None
+    }
 }

@@ -18,6 +18,14 @@ use tracing::{info, error, debug, warn};
 use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
 
+#[derive(Debug, Clone, Copy)]
+enum PackageStatus {
+    UpToDate,
+    PendingUpdates,
+    PhasedUpdates,  // Updates available but phased/held back
+    Missing,
+}
+
 use crate::{
     cli::{Cli, Commands, GroupCommands, GroupsCommands, SyncAction},
     config::Config,
@@ -249,6 +257,13 @@ async fn apply_group_templates(config: &Config, group: &str, files: Vec<PathBuf>
     }
 
     println!("Successfully applied all templates from group '{}'", group);
+    
+    // Also apply packages for this group
+    println!("Checking for package changes...");
+    if let Err(e) = apply_packages_for_group(config, group).await {
+        warn!("Failed to apply packages: {}", e);
+    }
+    
     Ok(())
 }
 
@@ -313,6 +328,7 @@ async fn unenroll_files(config: &Config, group: Option<String>, paths: Vec<PathB
 
 async fn show_status(config: &Config, detailed: bool) -> Result<()> {
     use crate::enrollment::EnrollmentManager;
+    use std::collections::HashMap;
 
     // Ensure distributed filesystem is available
     crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
@@ -361,6 +377,7 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
     debug!("Created enrollment manager");
 
     println!("\nEnrolled Files by Group:");
+    println!("Legend: ✓ = unchanged, ● = modified locally, ✗ = missing, ? = discovered");
 
     for group_name in &machine_groups {
         println!("\n  [{}]", group_name);
@@ -702,11 +719,314 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
         }
     }
 
-    println!("\nLegend: ✓ = unchanged, ● = modified locally, ✗ = missing, ? = discovered");
+    // Display package status
+    println!("\nPackage Management Status:");
+    println!("Legend: ✓ = up-to-date, ● = pending updates, ◐ = phased updates, ✗ = missing");
+    let pkg_manager = crate::package::PackageManager::new(config.mfs_mount.clone());
+    
+    // Collect commands across all groups
+    let mut all_commands: Vec<(String, &str, PackageStatus)> = Vec::new();
+    
+    for group_name in &machine_groups {
+        println!("\n  [{}]", group_name);
+        
+        // Load package operations for this group
+        match pkg_manager.load_package_operations(group_name, Some(&hostname)) {
+            Ok(operations) => {
+                if operations.is_empty() {
+                    println!("    (no packages managed)");
+                    continue;
+                }
+                
+                // Get system package manager
+                let system_pkg_mgr = match crate::package::detect_package_manager() {
+                    Some(mgr) => mgr,
+                    None => {
+                        println!("    ✗ No supported package manager detected");
+                        continue;
+                    }
+                };
+                
+                // Separate packages from commands
+                let mut package_statuses = Vec::new();
+                
+                for op in &operations {
+                    match op {
+                        crate::package::PackageOperation::Install { name } |
+                        crate::package::PackageOperation::Upgrade { name, .. } |
+                        crate::package::PackageOperation::Keep { name } => {
+                            // Check if package is installed
+                            let status = check_package_status(&system_pkg_mgr, name).await;
+                            package_statuses.push((name.clone(), status));
+                        }
+                        crate::package::PackageOperation::Remove { name } |
+                        crate::package::PackageOperation::Purge { name } => {
+                            // For remove/purge, we want to ensure it's NOT installed
+                            let status = check_package_status(&system_pkg_mgr, name).await;
+                            let display_status = match status {
+                                PackageStatus::Missing => PackageStatus::UpToDate, // Good - it should be missing
+                                _ => PackageStatus::UpToDate, // If installed, that's wrong but we don't show as error
+                            };
+                            package_statuses.push((format!("!{}", name), display_status));
+                        }
+                        crate::package::PackageOperation::UpdateAll { .. } => {
+                            all_commands.push((group_name.clone(), "++update", PackageStatus::UpToDate)); // TODO: Track actual status
+                        }
+                        crate::package::PackageOperation::UpgradeAll { .. } => {
+                            // Check if system has pending updates
+                            let has_updates = check_system_updates(&system_pkg_mgr).await;
+                            let has_phased = if has_updates {
+                                check_phased_updates(&system_pkg_mgr).await
+                            } else {
+                                false
+                            };
+                            
+                            let status = if has_phased {
+                                PackageStatus::PhasedUpdates
+                            } else if has_updates {
+                                PackageStatus::PendingUpdates
+                            } else {
+                                PackageStatus::UpToDate
+                            };
+                            all_commands.push((group_name.clone(), "++upgrade", status));
+                        }
+                    }
+                }
+                
+                // Display packages
+                if !package_statuses.is_empty() {
+                    println!("    Packages:");
+                    for (package, status) in &package_statuses {
+                        let status_char = match status {
+                            PackageStatus::UpToDate => "✓",
+                            PackageStatus::PendingUpdates => "●",
+                            PackageStatus::PhasedUpdates => "◐",  // Half-filled circle for phased
+                            PackageStatus::Missing => "✗",
+                        };
+                        println!("      {} {}", status_char, package);
+                    }
+                }
+                
+                
+                // Summary counts
+                let up_to_date = package_statuses.iter().filter(|(_, s)| matches!(s, PackageStatus::UpToDate)).count();
+                let pending = package_statuses.iter().filter(|(_, s)| matches!(s, PackageStatus::PendingUpdates)).count();
+                let missing = package_statuses.iter().filter(|(_, s)| matches!(s, PackageStatus::Missing)).count();
+                
+                let mut summary_parts = vec![];
+                if up_to_date > 0 {
+                    summary_parts.push(format!("{} up-to-date", up_to_date));
+                }
+                if pending > 0 {
+                    summary_parts.push(format!("{} pending updates", pending));
+                }
+                if missing > 0 {
+                    summary_parts.push(format!("{} missing", missing));
+                }
+                
+                if !summary_parts.is_empty() {
+                    println!("    Summary: {}", summary_parts.join(", "));
+                }
+            }
+            Err(e) => {
+                debug!("Failed to load package operations for '{}': {}", group_name, e);
+                println!("    (unable to load packages.conf)");
+            }
+        }
+    }
+
+    // Display commands section
+    if !all_commands.is_empty() {
+        println!("\nCommand Execution Status:");
+        println!("Legend: ✓ = successful/no updates needed, ● = updates available, ◐ = phased updates");
+        
+        // Group commands by group
+        for group_name in &machine_groups {
+            let group_commands: Vec<_> = all_commands.iter()
+                .filter(|(g, _, _)| g == group_name)
+                .collect();
+                
+            if !group_commands.is_empty() {
+                println!("\n  [{}]", group_name);
+                
+                // Get command history from actions database
+                let history = pkg_manager.get_command_history(group_name)
+                    .unwrap_or_else(|_| Vec::new());
+                
+                // Create a map of command history for quick lookup
+                let history_map: HashMap<String, (Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>)> = 
+                    history.into_iter()
+                        .map(|(cmd, added, executed)| (cmd, (added, executed)))
+                        .collect();
+                
+                // Display all commands from packages.conf
+                for (_, cmd_name, status) in &group_commands {
+                    let status_char = match status {
+                        PackageStatus::UpToDate => "✓",
+                        PackageStatus::PendingUpdates => "●",
+                        PackageStatus::PhasedUpdates => "◐",
+                        PackageStatus::Missing => "✗",
+                    };
+                    
+                    print!("    {} {}", status_char, cmd_name);
+                    
+                    // Add history information if available
+                    if let Some((added_at, executed_at)) = history_map.get(*cmd_name) {
+                        if let Some(added) = added_at {
+                            print!(" (added: {})", added.format("%Y-%m-%d %H:%M"));
+                        }
+                        
+                        if let Some(executed) = executed_at {
+                            print!(" (last executed: {})", executed.format("%Y-%m-%d %H:%M"));
+                        }
+                    }
+                    
+                    println!();
+                }
+            }
+        }
+    }
 
     Ok(())
 }
 
+async fn check_package_status(pkg_mgr: &crate::package::PackageManagerType, package: &str) -> PackageStatus {
+    use tokio::process::Command;
+    
+    let check_cmd = match pkg_mgr {
+        crate::package::PackageManagerType::Apt => {
+            format!("dpkg -l {} 2>/dev/null | grep -q '^ii'", package)
+        }
+        crate::package::PackageManagerType::Yum | 
+        crate::package::PackageManagerType::Dnf => {
+            format!("rpm -q {} >/dev/null 2>&1", package)
+        }
+        crate::package::PackageManagerType::Pacman => {
+            format!("pacman -Q {} >/dev/null 2>&1", package)
+        }
+        crate::package::PackageManagerType::Zypper => {
+            format!("rpm -q {} >/dev/null 2>&1", package)
+        }
+        crate::package::PackageManagerType::Apk => {
+            format!("apk info -e {} >/dev/null 2>&1", package)
+        }
+    };
+    
+    match Command::new("sh")
+        .arg("-c")
+        .arg(&check_cmd)
+        .status()
+        .await
+    {
+        Ok(status) => {
+            if status.success() {
+                // Package is installed, check if updates are available
+                let update_check_cmd = match pkg_mgr {
+                    crate::package::PackageManagerType::Apt => {
+                        format!("apt-cache policy {} | grep -q 'Installed:.*Candidate:' && ! apt-cache policy {} | grep -q 'Installed:.*Candidate:.*none'", package, package)
+                    }
+                    _ => {
+                        // For other package managers, we'll just say it's up to date if installed
+                        return PackageStatus::UpToDate;
+                    }
+                };
+                
+                match Command::new("sh")
+                    .arg("-c")
+                    .arg(&update_check_cmd)
+                    .status()
+                    .await
+                {
+                    Ok(update_status) => {
+                        if update_status.success() {
+                            PackageStatus::PendingUpdates
+                        } else {
+                            PackageStatus::UpToDate
+                        }
+                    }
+                    Err(_) => PackageStatus::UpToDate,
+                }
+            } else {
+                PackageStatus::Missing
+            }
+        }
+        Err(_) => PackageStatus::Missing,
+    }
+}
+
+async fn check_system_updates(pkg_mgr: &crate::package::PackageManagerType) -> bool {
+    use tokio::process::Command;
+    
+    let check_cmd = match pkg_mgr {
+        crate::package::PackageManagerType::Apt => {
+            "apt list --upgradable 2>/dev/null | grep -q upgradable"
+        }
+        crate::package::PackageManagerType::Yum => {
+            "yum check-update >/dev/null 2>&1; [ $? -eq 100 ]"
+        }
+        crate::package::PackageManagerType::Dnf => {
+            "dnf check-update >/dev/null 2>&1; [ $? -eq 100 ]"
+        }
+        crate::package::PackageManagerType::Pacman => {
+            "pacman -Qu >/dev/null 2>&1"
+        }
+        crate::package::PackageManagerType::Zypper => {
+            "zypper list-updates | grep -q '^v |'"
+        }
+        crate::package::PackageManagerType::Apk => {
+            "apk version -l '<' | grep -q '<'"
+        }
+    };
+    
+    match Command::new("sh")
+        .arg("-c")
+        .arg(check_cmd)
+        .status()
+        .await
+    {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
+}
+
+async fn check_phased_updates(pkg_mgr: &crate::package::PackageManagerType) -> bool {
+    use tokio::process::Command;
+    
+    // Only APT has phased updates
+    match pkg_mgr {
+        crate::package::PackageManagerType::Apt => {
+            // A simpler approach: check if apt-get upgrade -s would do nothing
+            // but apt list --upgradable shows packages
+            // More resilient command that handles edge cases
+            let check_cmd = r#"#!/bin/bash
+# Count total upgradable packages (excluding header line)
+total=$(apt list --upgradable 2>/dev/null | grep -v "^Listing" | grep "/" | wc -l)
+# Count packages that would actually be upgraded by apt-get upgrade
+would=$(apt-get -s upgrade 2>/dev/null | grep "^Inst " | wc -l)
+# Ensure we have numbers
+total=${total:-0}
+would=${would:-0}
+# If there are upgradable packages but apt-get upgrade would do nothing,
+# those are phased/held back
+if [ "$total" -gt 0 ] && [ "$would" -eq 0 ]; then
+    exit 0  # Phased updates detected
+else
+    exit 1  # No phased updates
+fi"#;
+            
+            match Command::new("sh")
+                .arg("-c")
+                .arg(check_cmd)
+                .status()
+                .await
+            {
+                Ok(status) => status.success(),
+                Err(_) => false,
+            }
+        }
+        _ => false, // Other package managers don't have phased updates
+    }
+}
 
 async fn commit_changes(
     config: &Config,
@@ -1477,9 +1797,23 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
     let mut known_template_timestamps: std::collections::HashMap<PathBuf, std::time::SystemTime> = std::collections::HashMap::new();
     let mut known_template_checksums: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
 
-    // Initial scan of templates
+    // Track packages.conf files
+    let mut packages_conf_checksums: HashMap<PathBuf, String> = HashMap::new();
+    let mut last_packages_scan = std::time::Instant::now();
+    let packages_scan_interval = Duration::from_secs(2); // Check every 2 seconds
+
+    // Initial scan of templates and packages.conf
     for group_name in &groups_to_watch {
         let group_dir = crate::fs::get_group_dir(&config.mfs_mount, "", group_name);
+        
+        // Check for packages.conf
+        let packages_conf_path = group_dir.join("etc").join("laszoo").join("packages.conf");
+        if packages_conf_path.exists() {
+            if let Ok(checksum) = calculate_file_checksum(&packages_conf_path) {
+                packages_conf_checksums.insert(packages_conf_path, checksum);
+            }
+        }
+        
         for entry in walkdir::WalkDir::new(&group_dir) {
             if let Ok(entry) = entry {
                 if entry.file_type().is_file() && entry.path().extension() == Some(std::ffi::OsStr::new("lasz")) {
@@ -1499,6 +1833,19 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
                     }
                 }
             }
+        }
+    }
+    
+    // Also check machine-specific packages.conf
+    let machine_packages_conf = config.mfs_mount
+        .join("machines")
+        .join(&hostname)
+        .join("etc")
+        .join("laszoo")
+        .join("packages.conf");
+    if machine_packages_conf.exists() {
+        if let Ok(checksum) = calculate_file_checksum(&machine_packages_conf) {
+            packages_conf_checksums.insert(machine_packages_conf, checksum);
         }
     }
 
@@ -1862,6 +2209,99 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
 
                     last_template_scan = std::time::Instant::now();
                 }
+                
+                // Periodic packages.conf scanning
+                if last_packages_scan.elapsed() > packages_scan_interval {
+                    debug!("Performing periodic packages.conf scan...");
+                    
+                    let mut packages_changed = false;
+                    
+                    // Check group packages.conf files
+                    for group_name in &groups_to_watch {
+                        let group_dir = crate::fs::get_group_dir(&config.mfs_mount, "", group_name);
+                        let packages_conf_path = group_dir.join("etc").join("laszoo").join("packages.conf");
+                        
+                        if packages_conf_path.exists() {
+                            if let Ok(current_checksum) = calculate_file_checksum(&packages_conf_path) {
+                                if let Some(known_checksum) = packages_conf_checksums.get(&packages_conf_path) {
+                                    if &current_checksum != known_checksum {
+                                        println!("\n[{}] Packages configuration changed for group '{}'",
+                                            chrono::Local::now().format("%H:%M:%S"),
+                                            group_name
+                                        );
+                                        packages_conf_checksums.insert(packages_conf_path.clone(), current_checksum);
+                                        packages_changed = true;
+                                        
+                                        // Apply package changes if auto mode is enabled
+                                        if auto {
+                                            println!("  → Auto-applying package changes...");
+                                            if let Err(e) = apply_packages_for_group(config, group_name).await {
+                                                error!("Failed to apply package changes: {}", e);
+                                                println!("  ✗ Failed to apply package changes: {}", e);
+                                            } else {
+                                                println!("  ✓ Package changes applied");
+                                            }
+                                        } else {
+                                            println!("  → Package changes detected (manual mode - run 'laszoo install {} --apply' to apply)", group_name);
+                                        }
+                                    }
+                                } else {
+                                    // New packages.conf file
+                                    packages_conf_checksums.insert(packages_conf_path.clone(), current_checksum);
+                                    println!("\n[{}] New packages configuration detected for group '{}'",
+                                        chrono::Local::now().format("%H:%M:%S"),
+                                        group_name
+                                    );
+                                    packages_changed = true;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Check machine-specific packages.conf
+                    let machine_packages_conf = config.mfs_mount
+                        .join("machines")
+                        .join(&hostname)
+                        .join("etc")
+                        .join("laszoo")
+                        .join("packages.conf");
+                        
+                    if machine_packages_conf.exists() {
+                        if let Ok(current_checksum) = calculate_file_checksum(&machine_packages_conf) {
+                            if let Some(known_checksum) = packages_conf_checksums.get(&machine_packages_conf) {
+                                if &current_checksum != known_checksum {
+                                    println!("\n[{}] Machine-specific packages configuration changed",
+                                        chrono::Local::now().format("%H:%M:%S")
+                                    );
+                                    packages_conf_checksums.insert(machine_packages_conf.clone(), current_checksum);
+                                    packages_changed = true;
+                                    
+                                    // Apply package changes if auto mode is enabled
+                                    if auto {
+                                        println!("  → Auto-applying machine-specific package changes...");
+                                        if let Err(e) = apply_machine_packages(config).await {
+                                            error!("Failed to apply package changes: {}", e);
+                                            println!("  ✗ Failed to apply package changes: {}", e);
+                                        } else {
+                                            println!("  ✓ Package changes applied");
+                                        }
+                                    } else {
+                                        println!("  → Package changes detected (manual mode)");
+                                    }
+                                }
+                            } else {
+                                // New packages.conf file
+                                packages_conf_checksums.insert(machine_packages_conf.clone(), current_checksum);
+                            }
+                        }
+                    }
+                    
+                    if packages_changed {
+                        println!(); // Add blank line for readability
+                    }
+                    
+                    last_packages_scan = std::time::Instant::now();
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 error!("Watcher channel disconnected");
@@ -2066,6 +2506,16 @@ fn store_group_config(
     Ok(())
 }
 
+async fn add_machine_to_group(config: &Config, group: &str) -> Result<()> {
+    let enrollment_manager = enrollment::EnrollmentManager::new(
+        config.mfs_mount.clone(),
+        "".to_string(),  // laszoo_dir is unused in the constructor
+    );
+    
+    enrollment_manager.add_machine_to_group(group)?;
+    Ok(())
+}
+
 async fn install_packages(config: &Config, group: &str, packages: Vec<String>, after: Option<&str>) -> Result<()> {
     use crate::package::PackageManager;
     
@@ -2101,33 +2551,38 @@ async fn install_packages(config: &Config, group: &str, packages: Vec<String>, a
         false
     };
     
-    if in_group {
-        info!("This machine is in group '{}', applying package changes locally", group);
+    if !in_group {
+        info!("This machine is not in group '{}', adding it now", group);
         
-        // Load operations for this machine
-        let operations = pkg_manager.load_package_operations(group, Some(&hostname))?;
+        // Add this machine to the group
+        add_machine_to_group(config, group).await?;
         
-        // Apply operations
-        pkg_manager.apply_operations(&operations).await?;
-        
-        // Run after command if provided
-        if let Some(cmd) = after {
-            info!("Running after command: {}", cmd);
-            use tokio::process::Command;
-            
-            let output = Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .output()
-                .await?;
-            
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!("After command failed: {}", stderr);
-            }
-        }
+        info!("Added machine to group '{}', applying package changes locally", group);
     } else {
-        info!("This machine is not in group '{}', changes will be applied when machines sync", group);
+        info!("This machine is in group '{}', applying package changes locally", group);
+    }
+    
+    // Load operations for this machine
+    let operations = pkg_manager.load_package_operations(group, Some(&hostname))?;
+    
+    // Apply operations
+    pkg_manager.apply_operations_with_group(&operations, Some(group)).await?;
+    
+    // Run after command if provided
+    if let Some(cmd) = after {
+        info!("Running after command: {}", cmd);
+        use tokio::process::Command;
+        
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output()
+            .await?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!("After command failed: {}", stderr);
+        }
     }
     
     println!("Successfully updated package configuration for group '{}'", group);
@@ -2138,15 +2593,9 @@ async fn install_packages(config: &Config, group: &str, packages: Vec<String>, a
     Ok(())
 }
 
-async fn patch_group(config: &Config, group: &str, before: Option<&str>, after: Option<&str>, rolling: bool) -> Result<()> {
-    use crate::package::{PackageManager, PackageManagerType};
+async fn apply_packages_for_group(config: &Config, group: &str) -> Result<()> {
+    use crate::package::PackageManager;
     
-    info!("Patching group '{}'", group);
-    
-    // Ensure distributed filesystem is available
-    crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
-    
-    // Get current hostname
     let hostname = gethostname::gethostname()
         .to_string_lossy()
         .to_string();
@@ -2168,89 +2617,142 @@ async fn patch_group(config: &Config, group: &str, before: Option<&str>, after: 
     };
     
     if !in_group {
-        println!("This machine is not in group '{}', skipping patch", group);
+        debug!("Machine is not in group '{}', skipping package application", group);
         return Ok(());
     }
     
-    // If rolling updates are enabled, check if another machine is already patching
-    if rolling {
-        let patch_lock = config.mfs_mount
-            .join("groups")
-            .join(group)
-            .join(".patch_lock");
-        
-        if patch_lock.exists() {
-            println!("Another machine is currently patching, waiting for turn...");
-            // In a real implementation, we'd wait and retry
-            return Ok(());
-        }
-        
-        // Create lock file
-        std::fs::write(&patch_lock, &hostname)?;
+    // Create package manager and load operations
+    let pkg_manager = PackageManager::new(config.mfs_mount.clone());
+    let operations = pkg_manager.load_package_operations(group, Some(&hostname))?;
+    
+    if !operations.is_empty() {
+        info!("Applying {} package operations for group '{}'", operations.len(), group);
+        pkg_manager.apply_operations_with_group(&operations, Some(group)).await?;
     }
     
-    // Run before command if provided
-    if let Some(cmd) = before {
-        info!("Running before command: {}", cmd);
-        use tokio::process::Command;
-        
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .output()
-            .await?;
-        
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            error!("Before command failed: {}", stderr);
-            return Err(LaszooError::Other("Before command failed".to_string()));
-        }
-    }
+    Ok(())
+}
+
+async fn apply_machine_packages(config: &Config) -> Result<()> {
+    use crate::package::PackageManager;
     
-    // Detect package manager and run system upgrade
-    let pkg_mgr = PackageManager::detect_package_manager()?;
+    let hostname = gethostname::gethostname()
+        .to_string_lossy()
+        .to_string();
+    
+    // Create package manager and load machine-specific operations
     let pkg_manager = PackageManager::new(config.mfs_mount.clone());
     
-    println!("Running system upgrade...");
-    pkg_manager.system_upgrade(&pkg_mgr).await?;
+    // Load operations from all groups the machine belongs to, plus machine-specific
+    let groups_file = config.mfs_mount
+        .join("machines")
+        .join(&hostname)
+        .join("etc")
+        .join("laszoo")
+        .join("groups.conf");
     
-    // Also apply any package operations from packages.conf
-    let operations = pkg_manager.load_package_operations(group, Some(&hostname))?;
-    if !operations.is_empty() {
-        println!("Applying package operations from packages.conf...");
-        pkg_manager.apply_operations(&operations).await?;
+    let machine_groups: Vec<String> = if groups_file.exists() {
+        std::fs::read_to_string(&groups_file)?
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    
+    // Collect all operations from groups and machine-specific
+    let mut all_operations = Vec::new();
+    
+    for group in &machine_groups {
+        let operations = pkg_manager.load_package_operations(group, Some(&hostname))?;
+        all_operations.extend(operations);
     }
     
-    // Run after command if provided
-    if let Some(cmd) = after {
-        info!("Running after command: {}", cmd);
-        use tokio::process::Command;
-        
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .output()
-            .await?;
-        
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!("After command failed: {}", stderr);
+    // Apply operations if any
+    if !all_operations.is_empty() {
+        info!("Applying {} package operations for machine", all_operations.len());
+        pkg_manager.apply_operations(&all_operations).await?;
+    }
+    
+    Ok(())
+}
+
+async fn patch_group(config: &Config, group: &str, before: Option<&str>, after: Option<&str>, _rolling: bool) -> Result<()> {
+    use crate::package::PackageManager;
+    
+    info!("Adding patch commands to group '{}'", group);
+    
+    // Ensure distributed filesystem is available
+    crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
+    
+    // Create package manager
+    let pkg_manager = PackageManager::new(config.mfs_mount.clone());
+    
+    // Build the ++update and ++upgrade lines
+    let mut update_line = "++update".to_string();
+    let mut upgrade_line = "++upgrade".to_string();
+    
+    // Add before/after actions if provided
+    if let Some(before_cmd) = before {
+        update_line.push_str(&format!(" --before {}", before_cmd));
+        upgrade_line.push_str(&format!(" --before {}", before_cmd));
+    }
+    
+    if let Some(after_cmd) = after {
+        update_line.push_str(&format!(" --after {}", after_cmd));
+        upgrade_line.push_str(&format!(" --after {}", after_cmd));
+    }
+    
+    // Read existing packages.conf
+    let packages_conf_path = pkg_manager.get_group_packages_path(group);
+    
+    // Create directory if needed
+    if let Some(parent) = packages_conf_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    
+    let mut content = if packages_conf_path.exists() {
+        std::fs::read_to_string(&packages_conf_path)?
+    } else {
+        // Create default header
+        "# Laszoo Package Configuration\n# Syntax:\n# ^package - Upgrade package\n# ^package --upgrade=command - Upgrade with post-action\n# ++update - Update package lists\n# ++update --before cmd --after cmd - Update with before/after actions\n# ++upgrade - Upgrade all packages\n# ++upgrade --before cmd --after cmd - Upgrade all with before/after actions\n# +package - Install package\n# =package - Keep package (don't auto-install/remove)\n# !package - Remove package\n# !!!package - Purge package\n\n".to_string()
+    };
+    
+    // Check if ++update or ++upgrade already exist
+    let has_update = content.lines().any(|line| line.trim().starts_with("++update"));
+    let has_upgrade = content.lines().any(|line| line.trim().starts_with("++upgrade"));
+    
+    // Append the patch commands if they don't exist
+    if !has_update || !has_upgrade {
+        if !content.ends_with('\n') && !content.is_empty() {
+            content.push('\n');
         }
-    }
-    
-    // Remove lock file if rolling
-    if rolling {
-        let patch_lock = config.mfs_mount
-            .join("groups")
-            .join(group)
-            .join(".patch_lock");
         
-        if patch_lock.exists() {
-            std::fs::remove_file(&patch_lock)?;
+        if !has_update {
+            content.push_str(&update_line);
+            content.push('\n');
         }
+        
+        if !has_upgrade {
+            content.push_str(&upgrade_line);
+            content.push('\n');
+        }
+        
+        // Write back to packages.conf
+        std::fs::write(&packages_conf_path, content)?;
+        
+        println!("Added patch commands to {}/etc/laszoo/packages.conf", group);
+        if !has_update {
+            println!("  + {}", update_line);
+        }
+        if !has_upgrade {
+            println!("  + {}", upgrade_line);
+        }
+        println!("\nMachines in group '{}' will apply patches when they run 'laszoo watch' or 'laszoo apply'", group);
+    } else {
+        println!("Patch commands already exist in {}/etc/laszoo/packages.conf", group);
     }
-    
-    println!("Successfully patched system for group '{}'", group);
     
     Ok(())
 }
