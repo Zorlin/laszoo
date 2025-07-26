@@ -9,6 +9,8 @@ mod monitor;
 mod sync;
 mod git;
 mod group;
+mod package;
+mod action;
 
 use clap::Parser;
 use tracing::{info, error, debug, warn};
@@ -70,6 +72,12 @@ async fn main() -> Result<()> {
         }
         Commands::Watch { group, interval, auto, hard } => {
             watch_for_changes(&config, group.as_deref(), interval, auto, hard).await?;
+        }
+        Commands::Install { group, packages, after } => {
+            install_packages(&config, &group, packages, after.as_deref()).await?;
+        }
+        Commands::Patch { group, before, after, rolling } => {
+            patch_group(&config, &group, before.as_deref(), after.as_deref(), rolling).await?;
         }
     }
 
@@ -163,7 +171,7 @@ async fn enroll_files(
 
     // If no paths provided, enroll the machine into the group
     if paths.is_empty() {
-        manager.enroll_path(group, None, force, machine, hybrid)?;
+        manager.enroll_path(group, None, force, machine, hybrid, before.clone(), after.clone())?;
         info!("Successfully enrolled machine into group '{}'", group);
 
         // Store triggers and action for this group if provided
@@ -178,7 +186,7 @@ async fn enroll_files(
     let mut error_count = 0;
 
     for path in paths {
-        match manager.enroll_path(group, Some(&path), force, machine, hybrid) {
+        match manager.enroll_path(group, Some(&path), force, machine, hybrid, before.clone(), after.clone()) {
             Ok(_) => {
                 info!("Enrolled: {:?}", path);
                 enrolled_count += 1;
@@ -696,7 +704,7 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
 async fn sync_files(
     config: &Config,
     group: Option<&str>,
-    _strategy: &crate::cli::SyncStrategy,
+    strategy: &crate::cli::SyncStrategy,
     dry_run: bool,
 ) -> Result<()> {
     use crate::sync::SyncEngine;
@@ -713,7 +721,7 @@ async fn sync_files(
     if let Some(group_name) = group {
         // Sync specific group
         info!("Analyzing group '{}' for synchronization", group_name);
-        let operations = engine.analyze_group(group_name).await?;
+        let operations = engine.analyze_group(group_name, strategy).await?;
 
         if operations.is_empty() {
             info!("No synchronization needed for group '{}'", group_name);
@@ -739,7 +747,7 @@ async fn sync_files(
         let mut total_operations = 0;
         for group_name in groups {
             info!("Analyzing group '{}'", group_name);
-            let operations = engine.analyze_group(&group_name).await?;
+            let operations = engine.analyze_group(&group_name, strategy).await?;
             total_operations += operations.len();
 
             if !operations.is_empty() {
@@ -1070,47 +1078,65 @@ fn update_machine_groups(mfs_mount: &Path, machine_name: &str, group_name: &str,
     // Write back
     std::fs::write(&groups_file, groups.join("\n") + "\n")?;
 
-    // Update symlinks in group directories
-    update_group_symlinks(mfs_mount, machine_name, &groups)?;
+    // Update membership symlinks
+    update_membership_symlinks(mfs_mount, machine_name, &groups)?;
 
     Ok(())
 }
 
-// Helper function to update symlinks in group directories
-fn update_group_symlinks(mfs_mount: &Path, machine_name: &str, groups: &[String]) -> Result<()> {
-    let groups_dir = mfs_mount.join("groups");
-    let machine_path = Path::new("../../../machines").join(machine_name);
-
-    // Remove old symlinks
-    if let Ok(entries) = std::fs::read_dir(&groups_dir) {
+// Helper function to update membership symlinks
+fn update_membership_symlinks(mfs_mount: &Path, machine_name: &str, groups: &[String]) -> Result<()> {
+    let memberships_dir = mfs_mount.join("memberships");
+    
+    // Remove old symlinks - check all group directories in memberships
+    if let Ok(entries) = std::fs::read_dir(&memberships_dir) {
         for entry in entries.flatten() {
             if let Ok(metadata) = entry.metadata() {
                 if metadata.is_dir() {
-                    let symlink_path = entry.path().join("machines").join(machine_name);
-                    if symlink_path.exists() || symlink_path.is_symlink() {
-                        let _ = std::fs::remove_file(&symlink_path);
+                    let symlink_path = entry.path().join(machine_name);
+                    // Remove symlink if it exists and is not in our current groups list
+                    if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
+                        if let Some(group_name) = entry.file_name().to_str() {
+                            if !groups.contains(&group_name.to_string()) {
+                                let _ = std::fs::remove_file(&symlink_path);
+                                debug!("Removed membership symlink for machine '{}' from group '{}'", machine_name, group_name);
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    // Create new symlinks
+    // Create new symlinks for current groups
     for group in groups {
-        let group_machines_dir = groups_dir.join(group).join("machines");
-
-        // Create machines directory if needed
-        if !group_machines_dir.exists() {
-            std::fs::create_dir_all(&group_machines_dir)?;
+        let membership_dir = memberships_dir.join(group);
+        
+        // Create membership directory if needed
+        if !membership_dir.exists() {
+            std::fs::create_dir_all(&membership_dir)?;
         }
 
-        let symlink_path = group_machines_dir.join(machine_name);
+        let symlink_path = membership_dir.join(machine_name);
+        
+        // Only create symlink if it doesn't exist
+        if !symlink_path.exists() && !symlink_path.symlink_metadata().is_ok() {
+            // Create relative symlink pointing to machine directory
+            let relative_machine_path = Path::new("../..")
+                .join("machines")
+                .join(machine_name);
 
-        // Create symlink
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            let _ = symlink(&machine_path, &symlink_path);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                symlink(&relative_machine_path, &symlink_path)?;
+                debug!("Created membership symlink for machine '{}' in group '{}'", machine_name, group);
+            }
+            
+            #[cfg(not(unix))]
+            {
+                warn!("Symlink creation not supported on this platform");
+            }
         }
     }
 
@@ -2021,5 +2047,194 @@ fn store_group_config(
     }
     info!("  Sync action: {:?}", action);
 
+    Ok(())
+}
+
+async fn install_packages(config: &Config, group: &str, packages: Vec<String>, after: Option<&str>) -> Result<()> {
+    use crate::package::PackageManager;
+    
+    info!("Installing packages for group '{}'", group);
+    
+    // Ensure distributed filesystem is available
+    crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
+    
+    // Create package manager
+    let pkg_manager = PackageManager::new(config.mfs_mount.clone());
+    
+    // Add packages to group's packages.conf
+    pkg_manager.add_packages_to_group(group, &packages, false)?;
+    
+    // Get current hostname
+    let hostname = gethostname::gethostname()
+        .to_string_lossy()
+        .to_string();
+    
+    // Check if this machine is in the group
+    let groups_file = config.mfs_mount
+        .join("machines")
+        .join(&hostname)
+        .join("etc")
+        .join("laszoo")
+        .join("groups.conf");
+    
+    let in_group = if groups_file.exists() {
+        let content = std::fs::read_to_string(&groups_file)?;
+        content.lines()
+            .any(|line| line.trim() == group)
+    } else {
+        false
+    };
+    
+    if in_group {
+        info!("This machine is in group '{}', applying package changes locally", group);
+        
+        // Load operations for this machine
+        let operations = pkg_manager.load_package_operations(group, Some(&hostname))?;
+        
+        // Apply operations
+        pkg_manager.apply_operations(&operations).await?;
+        
+        // Run after command if provided
+        if let Some(cmd) = after {
+            info!("Running after command: {}", cmd);
+            use tokio::process::Command;
+            
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .output()
+                .await?;
+            
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!("After command failed: {}", stderr);
+            }
+        }
+    } else {
+        info!("This machine is not in group '{}', changes will be applied when machines sync", group);
+    }
+    
+    println!("Successfully updated package configuration for group '{}'", group);
+    for package in &packages {
+        println!("  + {}", package);
+    }
+    
+    Ok(())
+}
+
+async fn patch_group(config: &Config, group: &str, before: Option<&str>, after: Option<&str>, rolling: bool) -> Result<()> {
+    use crate::package::{PackageManager, PackageManagerType};
+    
+    info!("Patching group '{}'", group);
+    
+    // Ensure distributed filesystem is available
+    crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
+    
+    // Get current hostname
+    let hostname = gethostname::gethostname()
+        .to_string_lossy()
+        .to_string();
+    
+    // Check if this machine is in the group
+    let groups_file = config.mfs_mount
+        .join("machines")
+        .join(&hostname)
+        .join("etc")
+        .join("laszoo")
+        .join("groups.conf");
+    
+    let in_group = if groups_file.exists() {
+        let content = std::fs::read_to_string(&groups_file)?;
+        content.lines()
+            .any(|line| line.trim() == group)
+    } else {
+        false
+    };
+    
+    if !in_group {
+        println!("This machine is not in group '{}', skipping patch", group);
+        return Ok(());
+    }
+    
+    // If rolling updates are enabled, check if another machine is already patching
+    if rolling {
+        let patch_lock = config.mfs_mount
+            .join("groups")
+            .join(group)
+            .join(".patch_lock");
+        
+        if patch_lock.exists() {
+            println!("Another machine is currently patching, waiting for turn...");
+            // In a real implementation, we'd wait and retry
+            return Ok(());
+        }
+        
+        // Create lock file
+        std::fs::write(&patch_lock, &hostname)?;
+    }
+    
+    // Run before command if provided
+    if let Some(cmd) = before {
+        info!("Running before command: {}", cmd);
+        use tokio::process::Command;
+        
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output()
+            .await?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!("Before command failed: {}", stderr);
+            return Err(LaszooError::Other("Before command failed".to_string()));
+        }
+    }
+    
+    // Detect package manager and run system upgrade
+    let pkg_mgr = PackageManager::detect_package_manager()?;
+    let pkg_manager = PackageManager::new(config.mfs_mount.clone());
+    
+    println!("Running system upgrade...");
+    pkg_manager.system_upgrade(&pkg_mgr).await?;
+    
+    // Also apply any package operations from packages.conf
+    let operations = pkg_manager.load_package_operations(group, Some(&hostname))?;
+    if !operations.is_empty() {
+        println!("Applying package operations from packages.conf...");
+        pkg_manager.apply_operations(&operations).await?;
+    }
+    
+    // Run after command if provided
+    if let Some(cmd) = after {
+        info!("Running after command: {}", cmd);
+        use tokio::process::Command;
+        
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output()
+            .await?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!("After command failed: {}", stderr);
+        }
+    }
+    
+    // Remove lock file if rolling
+    if rolling {
+        let patch_lock = config.mfs_mount
+            .join("groups")
+            .join(group)
+            .join(".patch_lock");
+        
+        if patch_lock.exists() {
+            std::fs::remove_file(&patch_lock)?;
+        }
+    }
+    
+    println!("Successfully patched system for group '{}'", group);
+    
     Ok(())
 }

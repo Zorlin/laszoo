@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use tracing::{info, debug, warn};
 use crate::error::{LaszooError, Result};
+use crate::action::{ActionManager, ActionPhase};
 use sha2::{Sha256, Digest};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,7 +113,7 @@ impl EnrollmentManager {
     }
 
     /// Enroll a file or directory into a group
-    pub fn enroll_path(&self, group: &str, path: Option<&Path>, force: bool, machine_specific: bool, hybrid: bool) -> Result<()> {
+    pub fn enroll_path(&self, group: &str, path: Option<&Path>, force: bool, machine_specific: bool, hybrid: bool, before: Option<String>, after: Option<String>) -> Result<()> {
         // If no path specified, enroll the machine into the group
         if path.is_none() {
             return self.enroll_machine_to_group(group);
@@ -128,9 +129,9 @@ impl EnrollmentManager {
         }
 
         if path.is_file() {
-            self.enroll_file(path, group, force, machine_specific, hybrid)
+            self.enroll_file(path, group, force, machine_specific, hybrid, before, after)
         } else if path.is_dir() {
-            self.enroll_directory(path, group, force, machine_specific, hybrid)
+            self.enroll_directory(path, group, force, machine_specific, hybrid, before, after)
         } else {
             Err(LaszooError::InvalidPath { 
                 path: path.to_path_buf() 
@@ -139,7 +140,7 @@ impl EnrollmentManager {
     }
 
     /// Enroll a file into a group
-    pub fn enroll_file(&self, file_path: &Path, group: &str, force: bool, machine_specific: bool, hybrid: bool) -> Result<()> {
+    pub fn enroll_file(&self, file_path: &Path, group: &str, force: bool, machine_specific: bool, hybrid: bool, before: Option<String>, after: Option<String>) -> Result<()> {
         // First ensure this machine is in the group
         self.add_machine_to_group(group)?;
         
@@ -185,11 +186,11 @@ impl EnrollmentManager {
         }
         
         // Not within any enrolled directory, proceed with normal enrollment
-        self.enroll_file_with_dir(file_path, group, force, machine_specific, hybrid, None)
+        self.enroll_file_with_dir(file_path, group, force, machine_specific, hybrid, None, before, after)
     }
     
     /// Enroll a file into a group with optional directory tracking
-    fn enroll_file_with_dir(&self, file_path: &Path, group: &str, force: bool, machine_specific: bool, hybrid: bool, enrolled_directory: Option<&Path>) -> Result<()> {
+    fn enroll_file_with_dir(&self, file_path: &Path, group: &str, force: bool, machine_specific: bool, hybrid: bool, enrolled_directory: Option<&Path>, before: Option<String>, after: Option<String>) -> Result<()> {
         // Check permissions
         if let Err(_) = fs::metadata(file_path) {
             return Err(LaszooError::PermissionDenied { 
@@ -310,11 +311,21 @@ impl EnrollmentManager {
             info!("Successfully enrolled {:?} into group '{}'", abs_path, group);
         }
         
+        // Store actions if provided
+        if before.is_some() || after.is_some() {
+            let action_manager = ActionManager::new(self.mfs_mount.clone());
+            if machine_specific {
+                action_manager.set_machine_actions(&abs_path, before, after)?;
+            } else {
+                action_manager.set_group_actions(group, &abs_path, before, after)?;
+            }
+        }
+        
         Ok(())
     }
 
     /// Enroll a directory recursively
-    fn enroll_directory(&self, dir_path: &Path, group: &str, force: bool, machine_specific: bool, hybrid: bool) -> Result<()> {
+    fn enroll_directory(&self, dir_path: &Path, group: &str, force: bool, machine_specific: bool, hybrid: bool, before: Option<String>, after: Option<String>) -> Result<()> {
         // First ensure this machine is in the group
         self.add_machine_to_group(group)?;
         
@@ -412,6 +423,16 @@ impl EnrollmentManager {
             }
         }
         
+        // Store actions if provided (for the directory itself)
+        if before.is_some() || after.is_some() {
+            let action_manager = ActionManager::new(self.mfs_mount.clone());
+            if machine_specific {
+                action_manager.set_machine_actions(&abs_path, before, after)?;
+            } else {
+                action_manager.set_group_actions(group, &abs_path, before, after)?;
+            }
+        }
+        
         Ok(())
     }
 
@@ -469,6 +490,42 @@ impl EnrollmentManager {
             // Write back
             fs::write(&groups_file, groups.join("\n") + "\n")?;
             info!("Added machine '{}' to group '{}'", self.hostname, group);
+            
+            // Create membership symlink
+            let membership_dir = self.mfs_mount
+                .join("memberships")
+                .join(group);
+            
+            // Create membership directory if needed
+            fs::create_dir_all(&membership_dir)?;
+            
+            // Create symlink from membership to machine directory
+            let symlink_path = membership_dir.join(&self.hostname);
+            let machine_dir = self.mfs_mount
+                .join("machines")
+                .join(&self.hostname);
+            
+            // Remove existing symlink if it exists
+            if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
+                fs::remove_file(&symlink_path).ok();
+            }
+            
+            // Create relative symlink
+            let relative_machine_path = PathBuf::from("../..")
+                .join("machines")
+                .join(&self.hostname);
+            
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                symlink(&relative_machine_path, &symlink_path)?;
+                info!("Created membership symlink for machine '{}' in group '{}'", self.hostname, group);
+            }
+            
+            #[cfg(not(unix))]
+            {
+                warn!("Symlink creation not supported on this platform");
+            }
         }
         
         Ok(())
@@ -494,6 +551,25 @@ impl EnrollmentManager {
     
     /// Apply a single template file to its target location
     pub fn apply_single_template(&self, template_path: &Path, target_path: &Path) -> Result<()> {
+        // Determine group from template path
+        let group = if template_path.starts_with(self.mfs_mount.join("groups")) {
+            // Extract group name from path: .../groups/<group>/...
+            template_path.strip_prefix(&self.mfs_mount)
+                .ok()
+                .and_then(|p| p.components().nth(1))
+                .and_then(|c| c.as_os_str().to_str())
+                .unwrap_or("")
+        } else {
+            ""
+        };
+        
+        // Execute before action if configured
+        let action_manager = ActionManager::new(self.mfs_mount.clone());
+        
+        if !group.is_empty() {
+            action_manager.execute_file_actions(group, target_path, ActionPhase::Before)?;
+        }
+        
         // Read template content
         let template_content = std::fs::read_to_string(template_path)?;
         
@@ -510,6 +586,11 @@ impl EnrollmentManager {
         
         // Copy metadata from template
         self.copy_metadata(template_path, target_path)?;
+        
+        // Execute after action if configured
+        if !group.is_empty() {
+            action_manager.execute_file_actions(group, target_path, ActionPhase::After)?;
+        }
         
         Ok(())
     }
@@ -547,6 +628,10 @@ impl EnrollmentManager {
     /// Apply a single template to create/update a local file
     fn apply_template(&self, group: &str, template_path: &Path, target_path: &Path) -> Result<()> {
         info!("Applying template {:?} to {:?}", template_path, target_path);
+        
+        // Execute before action if configured
+        let action_manager = ActionManager::new(self.mfs_mount.clone());
+        action_manager.execute_file_actions(group, target_path, ActionPhase::Before)?;
         
         // Read template content
         let template_content = fs::read_to_string(template_path)?;
@@ -602,6 +687,9 @@ impl EnrollmentManager {
         
         // Copy metadata from template
         self.copy_metadata(template_path, target_path)?;
+        
+        // Execute after action if configured
+        action_manager.execute_file_actions(group, target_path, ActionPhase::After)?;
         
         // Check if this file should be adopted into an enrolled directory instead of creating individual entry
         let abs_path = target_path.canonicalize().unwrap_or_else(|_| target_path.to_path_buf());

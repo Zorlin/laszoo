@@ -50,11 +50,11 @@ pub enum Commands {
         hybrid: bool,
         
         /// Command to run before applying changes
-        #[arg(long, value_name = "COMMAND")]
+        #[arg(long, value_name = "COMMAND", alias = "start")]
         before: Option<String>,
         
         /// Command to run after applying changes
-        #[arg(long, value_name = "COMMAND")]
+        #[arg(long, value_name = "COMMAND", alias = "end")]
         after: Option<String>,
         
         /// Sync action: converge (default), rollback, freeze, or drift
@@ -161,6 +161,38 @@ pub enum Commands {
         #[arg(long)]
         hard: bool,
     },
+    
+    /// Install packages on all systems in a group
+    Install {
+        /// Group name to install packages in
+        group: String,
+        
+        /// Package names to install
+        #[arg(short, long, required = true)]
+        packages: Vec<String>,
+        
+        /// Command to run after installing/updating each package
+        #[arg(long)]
+        after: Option<String>,
+    },
+    
+    /// Apply package updates to all systems in a group
+    Patch {
+        /// Group name to patch
+        group: String,
+        
+        /// Command to run before patching
+        #[arg(long)]
+        before: Option<String>,
+        
+        /// Command to run after patching
+        #[arg(long)]
+        after: Option<String>,
+        
+        /// Apply patches in a rolling fashion (one machine at a time)
+        #[arg(long)]
+        rolling: bool,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -171,6 +203,12 @@ pub enum SyncStrategy {
     Rollback,
     /// Forward local changes to other hosts
     Forward,
+    /// Merge local changes with template preserving variables
+    Converge,
+    /// Freeze - no changes allowed
+    Freeze,
+    /// Drift - report changes but don't sync
+    Drift,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, Default)]

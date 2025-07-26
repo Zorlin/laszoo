@@ -7,6 +7,14 @@ description = "Distributed configuration management with MooseFS"
 license = "AGPL-3.0"
 repository = "https://github.com/laszoo/laszoo"
 
+[lib]
+name = "laszoo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "laszoo"
+path = "src/main.rs"
+
 [dependencies]
 # CLI and configuration
 clap = { version = "4.5", features = ["derive", "env"] }

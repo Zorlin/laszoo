@@ -40,10 +40,15 @@ I then go to each additional machine I want to enroll, and run `laszoo enroll me
 
 Whenever I make a change to one of the servers, Laszoo will pick up on the change by comparing the watched file (`mfsmetalogger.cfg`) against the rendered version of the local file (`mfsmetalogger.cfg.lasz`).
 
-Triggers allow you to run commands before and after applying changes:
+Triggers allow you to run commands before and after applying changes.
+
+Actions allow you to specify the behaviour of the systems when dealing with this enrollment.
+
+For example:
 ```bash
 laszoo enroll metaloggers /etc/mfs/mfsmetalogger.cfg --after="systemctl reload mfsmetalogger" --action=converge
 ```
+
 Valid actions are:
 
 * `converge` - Capture the changes made on the local system and apply it to the template.
@@ -83,6 +88,8 @@ Removing the last member of a group will remove the group, unless you specify `-
 
 Machines will keep track of which groups they're in by interacting with $mountpoint/machines/machine-name/etc/laszoo/groups.conf.
 
+Groups will keep track of which machines they're in by creating symlinks for each server as `$mountpoint/memberships/group-name/machine-name/`.
+
 * Enforcement - `laszoo apply moosefs`
 
 Applies all files enrolled in the moosefs group to the local system.
@@ -114,6 +121,37 @@ Laszoo install will install the specified package on all systems in the moosefs 
 Laszoo patch will instruct all machines in the moosefs group to apply package upgrades (such as `apt upgrade`) automatically.
 
 Machines can be configured to apply patches in a rolling fashion, and can be configured to run a before and after command or script, using `--before` and `--after`.
+
+This is achieved by creating a special package line in $mountpoint/groupname/etc/laszoo/packages.conf
+
+* Update automation
+
+Machines can be configured to watch their machine folder for commands to update packages and package sources. This is achieved by creating actions that can be triggered from either the machine or group folders - commanding one or all machine in a group to apply patches or other update actions.
+
+Machines use a combination of last_seen_hash and last_seen_time to determine if they've seen an action line before, as well as a previous shadow copy of the configuration file that they keep for comparison.
+
+To apply updates, simply add these metapackages to packages.conf:
+```
+++update
+++upgrade
+```
+
+This will fetch the latest sources on each machine, then apply any needed updates.
+
+It will be applied once to each machine, then the machine will update status.conf for itself and if needed, reboot.
+
+You can apply "before" and "after" actions to the update and upgrade actions. These allow you specify that certain commands should be run before and afterwards, such as:
+
+```
+++update
+++upgrade
+before='curl $webhook_url -d "action=update&status=started&loadbalancer_state=drain"' --after 'curl $webhook_url -d "action=update&status=finished&loadbalancer_state=active"
+
+You can also use syntax such as `++update && ++upgrade` to only proceed if the update step was successful.
+
+Actions are applied in forward chronological order, ensuring that dependencies are met before proceeding.
+
+Advanced coordination and rollout strategies are planned that would allow for targeting a small percentage of machines at a time, allowing for gradual rollouts and testing. This will be achieved by iterating through the list of machines in a group and setting their machine's packages.conf file to include the update and upgrade actions, with delays and staggered execution times.
 
 * Action management - `laszoo act moosefs /etc/mfs/mfsmaster.cfg --before systemctl stop docker --after systemctl start docker`
 

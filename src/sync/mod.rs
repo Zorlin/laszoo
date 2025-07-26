@@ -5,6 +5,7 @@ use crate::error::{LaszooError, Result};
 use crate::enrollment::{EnrollmentManager, EnrollmentEntry};
 use crate::template::TemplateEngine;
 use crate::cli::SyncStrategy;
+use sha2::{Sha256, Digest};
 
 pub struct SyncEngine {
     mfs_mount: PathBuf,
@@ -16,27 +17,29 @@ pub struct SyncEngine {
 pub struct SyncOperation {
     pub file_path: PathBuf,
     pub group: String,
+    pub template_path: PathBuf,
     pub operation_type: SyncOperationType,
-    pub source_hosts: Vec<String>,
-    pub target_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub enum SyncOperationType {
-    /// Copy unchanged file from majority to minority hosts
+    /// Restore local file from template (template wins)
     Rollback { 
-        majority_content: String,
-        majority_hosts: Vec<String>,
+        template_content: String,
     },
-    /// Propagate local changes to all other hosts
+    /// Update template with local changes (local wins)
     Forward {
         local_content: String,
     },
-    /// Create merged template when hosts diverge
-    CreateTemplate {
+    /// Merge local changes into template preserving variables
+    Converge {
+        local_content: String,
         template_content: String,
-        divergent_sections: HashMap<String, Vec<String>>,
     },
+    /// Local changes detected but strategy is freeze (no action)
+    Freeze,
+    /// Local changes detected but strategy is drift (report only)
+    Drift,
 }
 
 impl SyncEngine {
@@ -55,34 +58,135 @@ impl SyncEngine {
     }
     
     /// Analyze files in a group and determine sync operations needed
-    pub async fn analyze_group(&self, group: &str) -> Result<Vec<SyncOperation>> {
+    pub async fn analyze_group(&self, group: &str, strategy: &SyncStrategy) -> Result<Vec<SyncOperation>> {
         let mut operations = Vec::new();
-        
-        // Get all hosts in the distributed filesystem
-        let all_hosts = self.discover_hosts()?;
-        info!("Discovered {} hosts in cluster", all_hosts.len());
         
         // Get enrolled files for this group on current host
         let manager = EnrollmentManager::new(
             self.mfs_mount.clone(),
             "".to_string()
         );
-        let local_entries = manager.list_enrolled_files(Some(group))?;
         
-        // For each enrolled file, check status across all hosts
-        for entry in local_entries {
-            let file_status = self.analyze_file_across_hosts(
-                &entry,
-                &all_hosts,
-                group
-            ).await?;
-            
-            if let Some(operation) = file_status {
+        // First check group manifest
+        let group_manifest = manager.load_group_manifest(group)?;
+        
+        // Then check machine manifest
+        let machine_manifest = manager.load_manifest()?;
+        
+        // Combine entries from both manifests
+        let mut all_entries = Vec::new();
+        
+        // Add group entries
+        for entry in group_manifest.entries.values() {
+            if entry.group == group {
+                all_entries.push(entry.clone());
+            }
+        }
+        
+        // Add machine-specific entries
+        for entry in machine_manifest.entries.values() {
+            if entry.group == group {
+                all_entries.push(entry.clone());
+            }
+        }
+        
+        // For each enrolled file, check if it differs from template
+        for entry in all_entries {
+            if let Some(operation) = self.analyze_file(&entry, group, strategy).await? {
                 operations.push(operation);
             }
         }
         
         Ok(operations)
+    }
+    
+    /// Analyze a single file and determine if sync is needed
+    async fn analyze_file(&self, entry: &EnrollmentEntry, group: &str, strategy: &SyncStrategy) -> Result<Option<SyncOperation>> {
+        let file_path = &entry.original_path;
+        
+        // Skip directories
+        if entry.checksum == "directory" {
+            return Ok(None);
+        }
+        
+        // Get template path
+        let template_path = if let Some(path) = &entry.template_path {
+            path.clone()
+        } else {
+            // Construct template path
+            let manager = EnrollmentManager::new(self.mfs_mount.clone(), "".to_string());
+            manager.get_group_template_path(group, file_path)?
+        };
+        
+        // Check if template exists
+        if !template_path.exists() {
+            warn!("Template missing for enrolled file: {:?}", file_path);
+            return Ok(None);
+        }
+        
+        // Check if local file exists
+        if !file_path.exists() {
+            // File is missing locally but has a template - needs rollback
+            let template_content = std::fs::read_to_string(&template_path)?;
+            return Ok(Some(SyncOperation {
+                file_path: file_path.clone(),
+                group: group.to_string(),
+                template_path: template_path.clone(),
+                operation_type: SyncOperationType::Rollback { template_content },
+            }));
+        }
+        
+        // Calculate current file checksum
+        let current_checksum = self.calculate_checksum(file_path)?;
+        
+        // Check if file has changed from enrolled checksum
+        if current_checksum == entry.checksum {
+            // File hasn't changed
+            return Ok(None);
+        }
+        
+        // File has changed - determine operation based on strategy
+        let local_content = std::fs::read_to_string(file_path)?;
+        let template_content = std::fs::read_to_string(&template_path)?;
+        
+        let operation_type = match strategy {
+            SyncStrategy::Converge => {
+                SyncOperationType::Converge {
+                    local_content,
+                    template_content,
+                }
+            }
+            SyncStrategy::Rollback => {
+                SyncOperationType::Rollback { 
+                    template_content,
+                }
+            }
+            SyncStrategy::Forward => {
+                SyncOperationType::Forward {
+                    local_content,
+                }
+            }
+            SyncStrategy::Freeze => {
+                SyncOperationType::Freeze
+            }
+            SyncStrategy::Drift => {
+                SyncOperationType::Drift
+            }
+            SyncStrategy::Auto => {
+                // Default to converge for auto
+                SyncOperationType::Converge {
+                    local_content,
+                    template_content,
+                }
+            }
+        };
+        
+        Ok(Some(SyncOperation {
+            file_path: file_path.clone(),
+            group: group.to_string(),
+            template_path,
+            operation_type,
+        }))
     }
     
     /// Execute sync operations
@@ -95,17 +199,20 @@ impl SyncEngine {
             info!("DRY RUN: Would perform {} sync operations", operations.len());
             for op in &operations {
                 match &op.operation_type {
-                    SyncOperationType::Rollback { majority_hosts, .. } => {
-                        println!("  [ROLLBACK] {:?} - restore from majority ({} hosts)", 
-                            op.file_path, majority_hosts.len());
+                    SyncOperationType::Rollback { .. } => {
+                        println!("  [ROLLBACK] {:?} - restore from template", op.file_path);
                     }
                     SyncOperationType::Forward { .. } => {
-                        println!("  [FORWARD] {:?} - propagate to {} hosts", 
-                            op.file_path, op.target_hosts.len());
+                        println!("  [FORWARD] {:?} - update template with local changes", op.file_path);
                     }
-                    SyncOperationType::CreateTemplate { divergent_sections, .. } => {
-                        println!("  [TEMPLATE] {:?} - create template with {} divergent sections", 
-                            op.file_path, divergent_sections.len());
+                    SyncOperationType::Converge { .. } => {
+                        println!("  [CONVERGE] {:?} - merge local changes into template", op.file_path);
+                    }
+                    SyncOperationType::Freeze => {
+                        println!("  [FREEZE] {:?} - no action (frozen)", op.file_path);
+                    }
+                    SyncOperationType::Drift => {
+                        println!("  [DRIFT] {:?} - detected drift (no action)", op.file_path);
                     }
                 }
             }
@@ -126,147 +233,18 @@ impl SyncEngine {
         Ok(())
     }
     
-    /// Determine sync strategy automatically based on majority
-    pub fn determine_sync_strategy(
-        &self,
-        strategy: &SyncStrategy,
-        file_versions: &HashMap<String, Vec<String>>, // checksum -> hosts
-    ) -> SyncOperationType {
-        match strategy {
-            SyncStrategy::Auto => {
-                // Find majority version
-                let (majority_checksum, majority_hosts) = file_versions.iter()
-                    .max_by_key(|(_, hosts)| hosts.len())
-                    .unwrap();
-                    
-                let total_hosts = file_versions.values()
-                    .map(|h| h.len())
-                    .sum::<usize>();
-                    
-                let majority_percentage = (majority_hosts.len() * 100) / total_hosts;
-                
-                if majority_percentage >= 60 {
-                    // Clear majority, rollback minority
-                    info!("Auto strategy: Rollback ({}% majority)", majority_percentage);
-                    self.determine_sync_strategy(&SyncStrategy::Rollback, file_versions)
-                } else {
-                    // No clear majority, create template
-                    info!("Auto strategy: Create template (no clear majority)");
-                    self.create_template_operation(file_versions)
-                }
-            }
-            SyncStrategy::Rollback => {
-                // Find majority and rollback others
-                let (majority_checksum, majority_hosts) = file_versions.iter()
-                    .max_by_key(|(_, hosts)| hosts.len())
-                    .unwrap();
-                    
-                // TODO: Read actual content from a majority host
-                let majority_content = String::new(); // Placeholder
-                
-                SyncOperationType::Rollback {
-                    majority_content,
-                    majority_hosts: majority_hosts.clone(),
-                }
-            }
-            SyncStrategy::Forward => {
-                // Forward local changes to all other hosts
-                let local_content = String::new(); // TODO: Read local file
-                
-                SyncOperationType::Forward {
-                    local_content,
-                }
-            }
-        }
-    }
-    
-    /// Discover all hosts in the cluster
-    fn discover_hosts(&self) -> Result<Vec<String>> {
-        let machines_dir = self.mfs_mount.join("machines");
-        
-        let mut hosts = Vec::new();
-        if machines_dir.exists() {
-            for entry in std::fs::read_dir(machines_dir)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    if let Some(hostname) = entry.file_name().to_str() {
-                        hosts.push(hostname.to_string());
-                    }
-                }
-            }
-        }
-        
-        Ok(hosts)
-    }
-    
-    /// Analyze a file across all hosts
-    async fn analyze_file_across_hosts(
-        &self,
-        entry: &EnrollmentEntry,
-        all_hosts: &[String],
-        group: &str,
-    ) -> Result<Option<SyncOperation>> {
-        let mut file_versions: HashMap<String, Vec<String>> = HashMap::new();
-        let file_path = &entry.original_path;
-        
-        // Check file on each host
-        for host in all_hosts {
-            let host_manifest_path = self.mfs_mount
-                .join("machines")
-                .join(host)
-                .join("manifest.json");
-                
-            if host_manifest_path.exists() {
-                // Load host's manifest
-                let manifest_content = std::fs::read_to_string(&host_manifest_path)?;
-                let manifest: crate::enrollment::EnrollmentManifest = 
-                    serde_json::from_str(&manifest_content)?;
-                
-                // Check if this host has the file enrolled
-                if let Some(host_entry) = manifest.is_enrolled(file_path) {
-                    if host_entry.group == group {
-                        file_versions.entry(host_entry.checksum.clone())
-                            .or_insert_with(Vec::new)
-                            .push(host.clone());
-                    }
-                }
-            }
-        }
-        
-        // If file exists on multiple hosts with different versions, sync is needed
-        if file_versions.len() > 1 {
-            let operation_type = self.determine_sync_strategy(
-                &SyncStrategy::Auto,
-                &file_versions
-            );
-            
-            let all_involved_hosts: Vec<String> = file_versions.values()
-                .flatten()
-                .cloned()
-                .collect();
-            
-            Ok(Some(SyncOperation {
-                file_path: file_path.clone(),
-                group: group.to_string(),
-                operation_type,
-                source_hosts: vec![self.hostname.clone()],
-                target_hosts: all_involved_hosts,
-            }))
-        } else {
-            // No sync needed
-            Ok(None)
-        }
-    }
     
     /// Execute a single sync operation
     async fn execute_operation(&self, operation: SyncOperation) -> Result<()> {
         match operation.operation_type {
-            SyncOperationType::Rollback { majority_content, majority_hosts } => {
-                info!("Rolling back {:?} to majority version from {:?}", 
-                    operation.file_path, majority_hosts);
+            SyncOperationType::Rollback { template_content } => {
+                info!("Rolling back {:?} to template version", operation.file_path);
                 
-                // Write majority content to local file
-                std::fs::write(&operation.file_path, majority_content)?;
+                // Process template to handle variables
+                let processed_content = crate::template::process_handlebars(&template_content, &self.hostname)?;
+                
+                // Write processed content to local file
+                std::fs::write(&operation.file_path, &processed_content)?;
                 
                 // Update local manifest with new checksum
                 let manager = EnrollmentManager::new(
@@ -274,40 +252,79 @@ impl SyncEngine {
                     "".to_string()
                 );
                 
-                // Re-enroll to update checksum (not machine-specific, not hybrid)
-                manager.enroll_file(&operation.file_path, &operation.group, true, false, false)?;
-            }
-            SyncOperationType::Forward { local_content: _ } => {
-                info!("Forwarding {:?} to all hosts", operation.file_path);
+                // Update checksum in manifest
+                let mut manifest = manager.load_manifest()?;
+                if let Some(entry) = manifest.entries.get_mut(&operation.file_path) {
+                    entry.checksum = self.calculate_checksum(&operation.file_path)?;
+                    entry.last_synced = Some(chrono::Utc::now());
+                    manager.save_manifest(&manifest)?;
+                }
                 
-                // TODO: Update to use group templates instead of host-to-host sync
-                warn!("Forward sync not yet implemented with new group template architecture");
-                return Err(LaszooError::Other("Forward sync needs refactoring for group templates".to_string()));
+                info!("Successfully rolled back {:?}", operation.file_path);
             }
-            SyncOperationType::CreateTemplate { template_content: _, divergent_sections: _ } => {
-                info!("Creating template for {:?}", operation.file_path);
+            SyncOperationType::Forward { local_content } => {
+                info!("Forwarding {:?} changes to template", operation.file_path);
                 
-                // TODO: Update to save as group template instead
-                warn!("CreateTemplate not yet implemented with new group template architecture");
-                return Err(LaszooError::Other("CreateTemplate needs refactoring for group templates".to_string()));
+                // Write local content to template
+                std::fs::write(&operation.template_path, &local_content)?;
+                
+                // Update checksum in manifest
+                let manager = EnrollmentManager::new(
+                    self.mfs_mount.clone(),
+                    "".to_string()
+                );
+                
+                let mut manifest = manager.load_manifest()?;
+                if let Some(entry) = manifest.entries.get_mut(&operation.file_path) {
+                    entry.checksum = self.calculate_checksum(&operation.file_path)?;
+                    entry.last_synced = Some(chrono::Utc::now());
+                    manager.save_manifest(&manifest)?;
+                }
+                
+                info!("Successfully updated template for {:?}", operation.file_path);
+            }
+            SyncOperationType::Converge { local_content, template_content } => {
+                info!("Converging {:?} - merging local changes into template", operation.file_path);
+                
+                // Use template engine to merge changes
+                let merged_content = self.template_engine.merge_file_changes_to_template(
+                    &template_content,
+                    &local_content
+                )?;
+                
+                // Write merged content to template
+                std::fs::write(&operation.template_path, &merged_content)?;
+                
+                // Update checksum in manifest
+                let manager = EnrollmentManager::new(
+                    self.mfs_mount.clone(),
+                    "".to_string()
+                );
+                
+                let mut manifest = manager.load_manifest()?;
+                if let Some(entry) = manifest.entries.get_mut(&operation.file_path) {
+                    entry.checksum = self.calculate_checksum(&operation.file_path)?;
+                    entry.last_synced = Some(chrono::Utc::now());
+                    manager.save_manifest(&manifest)?;
+                }
+                
+                info!("Successfully converged {:?}", operation.file_path);
+            }
+            SyncOperationType::Freeze => {
+                info!("File {:?} is frozen - no action taken", operation.file_path);
+            }
+            SyncOperationType::Drift => {
+                warn!("Drift detected in {:?} - no action taken", operation.file_path);
             }
         }
         
         Ok(())
     }
     
-    /// Create a template operation when hosts diverge
-    fn create_template_operation(
-        &self,
-        file_versions: &HashMap<String, Vec<String>>,
-    ) -> SyncOperationType {
-        // TODO: Actually read file contents from each host and merge
-        let template_content = String::new(); // Placeholder
-        let divergent_sections = HashMap::new(); // Placeholder
-        
-        SyncOperationType::CreateTemplate {
-            template_content,
-            divergent_sections,
-        }
+    fn calculate_checksum(&self, path: &Path) -> Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut file, &mut hasher)?;
+        Ok(format!("{:x}", hasher.finalize()))
     }
 }
