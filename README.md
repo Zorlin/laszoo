@@ -144,8 +144,8 @@ You can apply "before" and "after" actions to the update and upgrade actions. Th
 
 ```
 ++update
-++upgrade
-before='curl $webhook_url -d "action=update&status=started&loadbalancer_state=drain"' --after 'curl $webhook_url -d "action=update&status=finished&loadbalancer_state=active"
+++upgrade --before='curl $webhook_url -d "action=update&status=started&loadbalancer_state=drain"' --after 'curl $webhook_url -d "action=update&status=finished&loadbalancer_state=active"
+```
 
 You can also use syntax such as `++update && ++upgrade` to only proceed if the update step was successful.
 
