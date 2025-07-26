@@ -72,16 +72,6 @@ pub enum Commands {
         paths: Vec<PathBuf>,
     },
     
-    /// Synchronize configuration files
-    Sync {
-        /// Specific group to sync (all groups if not specified)
-        #[arg(short, long)]
-        group: Option<String>,
-        
-        /// Sync strategy to use
-        #[arg(short, long, value_enum, default_value = "auto")]
-        strategy: SyncStrategy,
-    },
     
     /// Show status of enrolled files and synchronization
     Status {
@@ -234,22 +224,6 @@ pub enum ServiceCommands {
     
     /// Show status of the Laszoo service
     Status,
-}
-
-#[derive(clap::ValueEnum, Clone, Debug)]
-pub enum SyncStrategy {
-    /// Automatically choose strategy based on majority
-    Auto,
-    /// Rollback minority changes to majority configuration
-    Rollback,
-    /// Forward local changes to other hosts
-    Forward,
-    /// Merge local changes with template preserving variables
-    Converge,
-    /// Freeze - no changes allowed
-    Freeze,
-    /// Drift - report changes but don't sync
-    Drift,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, Default)]

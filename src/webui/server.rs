@@ -56,7 +56,6 @@ impl WebServer {
             .route("/api/files", get(crate::webui::handlers::get_enrolled_files))
             .route("/api/files/enroll", post(crate::webui::handlers::enroll_file))
             .route("/api/files/unenroll", post(crate::webui::handlers::unenroll_file))
-            .route("/api/sync", post(crate::webui::handlers::trigger_sync))
             .route("/api/operations", get(crate::webui::handlers::get_operations))
             
             // WebSocket for real-time updates

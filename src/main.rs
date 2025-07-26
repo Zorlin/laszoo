@@ -6,7 +6,6 @@ mod logging;
 mod enrollment;
 mod template;
 mod monitor;
-mod sync;
 mod git;
 mod group;
 mod package;
@@ -51,9 +50,6 @@ async fn main() -> Result<()> {
         }
         Commands::Unenroll { group, paths } => {
             unenroll_files(&config, group, paths).await?;
-        }
-        Commands::Sync { group, strategy } => {
-            sync_files(&config, group.as_deref(), &strategy, cli.dry_run).await?;
         }
         Commands::Status { detailed } => {
             show_status(&config, detailed).await?;
@@ -711,69 +707,6 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
     Ok(())
 }
 
-async fn sync_files(
-    config: &Config,
-    group: Option<&str>,
-    strategy: &crate::cli::SyncStrategy,
-    dry_run: bool,
-) -> Result<()> {
-    use crate::sync::SyncEngine;
-
-    // Ensure distributed filesystem is available
-    crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
-
-    // Create sync engine
-    let engine = SyncEngine::new(
-        config.mfs_mount.clone(),
-        "".to_string()
-    )?;
-
-    if let Some(group_name) = group {
-        // Sync specific group
-        info!("Analyzing group '{}' for synchronization", group_name);
-        let operations = engine.analyze_group(group_name, strategy).await?;
-
-        if operations.is_empty() {
-            info!("No synchronization needed for group '{}'", group_name);
-        } else {
-            info!("Found {} files needing synchronization", operations.len());
-            engine.execute_sync(operations, dry_run).await?;
-        }
-    } else {
-        // Sync all groups
-        info!("Analyzing all groups for synchronization");
-
-        // Get all unique groups from manifest
-        let manager = crate::enrollment::EnrollmentManager::new(
-            config.mfs_mount.clone(),
-            "".to_string()
-        );
-        let manifest = manager.load_manifest()?;
-        let groups: std::collections::HashSet<_> = manifest.entries
-            .values()
-            .map(|e| e.group.clone())
-            .collect();
-
-        let mut total_operations = 0;
-        for group_name in groups {
-            info!("Analyzing group '{}'", group_name);
-            let operations = engine.analyze_group(&group_name, strategy).await?;
-            total_operations += operations.len();
-
-            if !operations.is_empty() {
-                engine.execute_sync(operations, dry_run).await?;
-            }
-        }
-
-        if total_operations == 0 {
-            info!("No synchronization needed across all groups");
-        } else {
-            info!("Synchronized {} files across all groups", total_operations);
-        }
-    }
-
-    Ok(())
-}
 
 async fn commit_changes(
     config: &Config,

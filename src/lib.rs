@@ -6,7 +6,6 @@ pub mod logging;
 pub mod enrollment;
 pub mod template;
 pub mod monitor;
-pub mod sync;
 pub mod git;
 pub mod group;
 pub mod package;

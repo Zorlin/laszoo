@@ -1,7 +1,6 @@
 use crate::webui::{WebUIState, FileStatus, GroupInfo, SystemStatus};
 use crate::webui::server::AppState;
 use crate::enrollment::EnrollmentManager;
-use crate::sync::SyncEngine;
 use axum::{
     extract::{Path, State},
     Json,
@@ -196,31 +195,6 @@ pub async fn unenroll_file(
             ).into_response()
         }
     }
-}
-
-#[derive(Deserialize)]
-pub struct SyncRequest {
-    pub group: Option<String>,
-    pub strategy: String,
-}
-
-pub async fn trigger_sync(
-    State(state): State<AppState>,
-    Json(req): Json<SyncRequest>,
-) -> impl IntoResponse {
-    let strategy = match req.strategy.as_str() {
-        "auto" => crate::cli::SyncStrategy::Auto,
-        "rollback" => crate::cli::SyncStrategy::Rollback,
-        "forward" => crate::cli::SyncStrategy::Forward,
-        "converge" => crate::cli::SyncStrategy::Converge,
-        "freeze" => crate::cli::SyncStrategy::Freeze,
-        "drift" => crate::cli::SyncStrategy::Drift,
-        _ => crate::cli::SyncStrategy::Auto,
-    };
-    
-    // This would trigger an async sync operation
-    // For now, just return success
-    Json(ApiResponse::success("Sync operation started"))
 }
 
 pub async fn get_operations(
