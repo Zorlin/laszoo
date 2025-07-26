@@ -12,3 +12,4 @@ pub mod group;
 pub mod package;
 pub mod action;
 pub mod service;
+pub mod webui;

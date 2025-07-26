@@ -12,6 +12,7 @@ mod group;
 mod package;
 mod action;
 mod service;
+mod webui;
 
 use clap::Parser;
 use tracing::{info, error, debug, warn};
@@ -82,6 +83,11 @@ async fn main() -> Result<()> {
         }
         Commands::Service { command } => {
             handle_service_command(command).await?;
+        }
+        Commands::WebUI { port, bind: _ } => {
+            let webui = crate::webui::WebUI::new(std::sync::Arc::new(config));
+            info!("Starting Laszoo Web UI on http://0.0.0.0:{}", port);
+            webui.start(port).await?;
         }
     }
 

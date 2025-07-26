@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Laszoo Control Panel</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div id="app">
+        <header>
+            <h1>Laszoo Control Panel</h1>
+            <div class="status-bar">
+                <span id="hostname">Loading...</span>
+                <span id="mfs-status" class="status-indicator">MFS: Unknown</span>
+                <span id="service-status" class="status-indicator">Service: Unknown</span>
+                <span id="gamepad-status" class="status-indicator">Gamepad: Disconnected</span>
+            </div>
+        </header>
+        
+        <nav class="tabs">
+            <button class="tab-button active" data-tab="overview">Overview</button>
+            <button class="tab-button" data-tab="files">Enrolled Files</button>
+            <button class="tab-button" data-tab="groups">Groups</button>
+            <button class="tab-button" data-tab="operations">Operations</button>
+            <button class="tab-button" data-tab="gamepad">Gamepad</button>
+        </nav>
+        
+        <main>
+            <!-- Overview Tab -->
+            <div id="overview" class="tab-content active">
+                <div class="dashboard">
+                    <div class="card">
+                        <h3>System Status</h3>
+                        <div id="system-info">
+                            <p>Loading system information...</p>
+                        </div>
+                    </div>
+                    
+                    <div class="card">
+                        <h3>Quick Actions</h3>
+                        <div class="button-group">
+                            <button id="sync-all" class="action-button">Sync All</button>
+                            <button id="check-status" class="action-button">Check Status</button>
+                            <button id="reload-service" class="action-button">Reload Service</button>
+                        </div>
+                    </div>
+                    
+                    <div class="card">
+                        <h3>Recent Activity</h3>
+                        <div id="activity-log" class="log-container">
+                            <p>No recent activity</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Files Tab -->
+            <div id="files" class="tab-content">
+                <div class="toolbar">
+                    <button id="enroll-file" class="action-button primary">Enroll New File</button>
+                    <input type="text" id="file-search" placeholder="Search files..." class="search-input">
+                </div>
+                
+                <table id="files-table" class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Path</th>
+                            <th>Group</th>
+                            <th>Status</th>
+                            <th>Last Modified</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td colspan="5" class="empty-state">No enrolled files</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            
+            <!-- Groups Tab -->
+            <div id="groups" class="tab-content">
+                <div class="toolbar">
+                    <button id="create-group" class="action-button primary">Create Group</button>
+                </div>
+                
+                <div id="groups-grid" class="grid">
+                    <p class="empty-state">No groups configured</p>
+                </div>
+            </div>
+            
+            <!-- Operations Tab -->
+            <div id="operations" class="tab-content">
+                <div id="operations-list">
+                    <p class="empty-state">No active operations</p>
+                </div>
+            </div>
+            
+            <!-- Gamepad Tab -->
+            <div id="gamepad" class="tab-content">
+                <div class="gamepad-container">
+                    <h3>Gamepad Configuration</h3>
+                    <div id="gamepad-visual" class="gamepad-visual">
+                        <svg viewBox="0 0 600 400" id="gamepad-svg">
+                            <!-- Gamepad visualization will be drawn here -->
+                        </svg>
+                    </div>
+                    
+                    <div class="gamepad-mappings">
+                        <h4>Button Mappings</h4>
+                        <div id="button-mappings">
+                            <div class="mapping-row">
+                                <span>A Button:</span>
+                                <select id="map-a">
+                                    <option value="none">None</option>
+                                    <option value="sync">Sync Current File</option>
+                                    <option value="apply">Apply Templates</option>
+                                    <option value="status">Check Status</option>
+                                </select>
+                            </div>
+                            <div class="mapping-row">
+                                <span>B Button:</span>
+                                <select id="map-b">
+                                    <option value="none">None</option>
+                                    <option value="cancel">Cancel Operation</option>
+                                    <option value="back">Go Back</option>
+                                </select>
+                            </div>
+                            <div class="mapping-row">
+                                <span>D-Pad:</span>
+                                <select id="map-dpad">
+                                    <option value="navigation">Navigate UI</option>
+                                    <option value="files">Browse Files</option>
+                                    <option value="groups">Browse Groups</option>
+                                </select>
+                            </div>
+                            <div class="mapping-row">
+                                <span>Left Stick:</span>
+                                <select id="map-lstick">
+                                    <option value="scroll">Scroll</option>
+                                    <option value="cursor">Move Cursor</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="gamepad-status-details">
+                        <h4>Controller Status</h4>
+                        <div id="controller-details">
+                            <p>No controller connected</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+    <!-- Enroll File Modal -->
+    <div id="enroll-modal" class="modal">
+        <div class="modal-content">
+            <h3>Enroll File</h3>
+            <form id="enroll-form">
+                <div class="form-group">
+                    <label for="enroll-path">File Path:</label>
+                    <input type="text" id="enroll-path" required>
+                </div>
+                <div class="form-group">
+                    <label for="enroll-group">Group:</label>
+                    <input type="text" id="enroll-group" required>
+                </div>
+                <div class="form-group">
+                    <label for="enroll-action">Sync Action:</label>
+                    <select id="enroll-action">
+                        <option value="converge">Converge</option>
+                        <option value="rollback">Rollback</option>
+                        <option value="freeze">Freeze</option>
+                        <option value="drift">Drift</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="enroll-machine">
+                        Machine-specific enrollment
+                    </label>
+                </div>
+                <div class="modal-buttons">
+                    <button type="submit" class="action-button primary">Enroll</button>
+                    <button type="button" class="action-button" onclick="closeModal()">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <script src="/static/app.js"></script>
+</body>
+</html>

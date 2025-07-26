@@ -1,0 +1,311 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div x-cloak>
+    <!-- Overview Tab -->
+    <div x-show="activeTab === 'overview'" class="space-y-6">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div class="bg-white rounded-lg shadow p-6">
+                <h3 class="text-lg font-medium text-gray-900 mb-4">System Status</h3>
+                <dl class="space-y-2">
+                    <div class="flex justify-between">
+                        <dt class="text-sm text-gray-600">Hostname:</dt>
+                        <dd class="text-sm font-medium text-gray-900" x-text="hostname">-</dd>
+                    </div>
+                    <div class="flex justify-between">
+                        <dt class="text-sm text-gray-600">Mount Path:</dt>
+                        <dd class="text-sm font-medium text-gray-900">/mnt/laszoo</dd>
+                    </div>
+                    <div class="flex justify-between">
+                        <dt class="text-sm text-gray-600">Service Mode:</dt>
+                        <dd class="text-sm font-medium text-gray-900" x-text="serviceMode">-</dd>
+                    </div>
+                </dl>
+            </div>
+
+            <div class="bg-white rounded-lg shadow p-6">
+                <h3 class="text-lg font-medium text-gray-900 mb-4">Quick Actions</h3>
+                <div class="space-y-2">
+                    <button @click="syncAll()" class="w-full px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition-colors">
+                        Sync All
+                    </button>
+                    <button @click="checkStatus()" class="w-full px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 transition-colors">
+                        Check Status
+                    </button>
+                    <button @click="reloadService()" class="w-full px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 transition-colors">
+                        Reload Service
+                    </button>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-lg shadow p-6">
+                <h3 class="text-lg font-medium text-gray-900 mb-4">Recent Activity</h3>
+                <div class="space-y-2 max-h-40 overflow-y-auto">
+                    <template x-for="activity in recentActivity" :key="activity.id">
+                        <div class="text-sm">
+                            <span class="text-gray-500" x-text="activity.time"></span>
+                            <span class="text-gray-700" x-text="activity.message"></span>
+                        </div>
+                    </template>
+                    <div x-show="recentActivity.length === 0" class="text-sm text-gray-500">
+                        No recent activity
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Files Tab -->
+    <div x-show="activeTab === 'files'" class="space-y-4">
+        <div class="flex justify-between items-center">
+            <button @click="showEnrollModal = true" class="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition-colors">
+                Enroll New File
+            </button>
+            <input type="text" x-model="fileSearch" placeholder="Search files..." 
+                   class="px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500">
+        </div>
+
+        <div class="bg-white rounded-lg shadow overflow-hidden">
+            <table class="min-w-full divide-y divide-gray-200">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Path</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Group</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Modified</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200">
+                    <template x-for="file in filteredFiles" :key="file.path">
+                        <tr class="hover:bg-gray-50">
+                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900" x-text="file.path"></td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="file.group"></td>
+                            <td class="px-6 py-4 whitespace-nowrap">
+                                <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full"
+                                      :class="file.status === 'synced' ? 'bg-green-100 text-green-800' : 'bg-yellow-100 text-yellow-800'"
+                                      x-text="file.status">
+                                </span>
+                            </td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="file.lastModified"></td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                                <button @click="syncFile(file)" class="text-indigo-600 hover:text-indigo-900 mr-2">Sync</button>
+                                <button @click="unenrollFile(file)" class="text-red-600 hover:text-red-900">Unenroll</button>
+                            </td>
+                        </tr>
+                    </template>
+                    <tr x-show="filteredFiles.length === 0">
+                        <td colspan="5" class="px-6 py-4 text-center text-sm text-gray-500">
+                            No enrolled files
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Groups Tab -->
+    <div x-show="activeTab === 'groups'" class="space-y-4">
+        <div class="flex justify-end">
+            <button @click="showCreateGroupModal = true" class="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition-colors">
+                Create Group
+            </button>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <template x-for="group in groups" :key="group.name">
+                <div class="bg-white rounded-lg shadow p-6 hover:shadow-lg transition-shadow">
+                    <h3 class="text-lg font-medium text-gray-900 mb-2" x-text="group.name"></h3>
+                    <p class="text-sm text-gray-600 mb-4" x-text="`${group.fileCount} files`"></p>
+                    <div class="flex space-x-2">
+                        <button @click="syncGroup(group)" class="flex-1 px-3 py-1 bg-indigo-600 text-white rounded text-sm hover:bg-indigo-700">
+                            Sync
+                        </button>
+                        <button @click="viewGroup(group)" class="flex-1 px-3 py-1 bg-gray-600 text-white rounded text-sm hover:bg-gray-700">
+                            View
+                        </button>
+                    </div>
+                </div>
+            </template>
+            <div x-show="groups.length === 0" class="col-span-full text-center text-gray-500">
+                No groups configured
+            </div>
+        </div>
+    </div>
+
+    <!-- Operations Tab -->
+    <div x-show="activeTab === 'operations'" class="space-y-4">
+        <div class="bg-white rounded-lg shadow">
+            <div class="px-6 py-4 border-b border-gray-200">
+                <h3 class="text-lg font-medium text-gray-900">Active Operations</h3>
+            </div>
+            <div class="p-6">
+                <template x-for="operation in activeOperations" :key="operation.id">
+                    <div class="mb-4 p-4 bg-gray-50 rounded-lg">
+                        <div class="flex justify-between items-start mb-2">
+                            <div>
+                                <h4 class="font-medium text-gray-900" x-text="operation.type"></h4>
+                                <p class="text-sm text-gray-600" x-text="operation.description"></p>
+                            </div>
+                            <span class="px-2 py-1 text-xs font-medium rounded-full"
+                                  :class="operation.status === 'running' ? 'bg-blue-100 text-blue-800' : 'bg-green-100 text-green-800'"
+                                  x-text="operation.status">
+                            </span>
+                        </div>
+                        <div class="w-full bg-gray-200 rounded-full h-2">
+                            <div class="bg-indigo-600 h-2 rounded-full transition-all duration-300"
+                                 :style="`width: ${operation.progress}%`"></div>
+                        </div>
+                    </div>
+                </template>
+                <div x-show="activeOperations.length === 0" class="text-center text-gray-500">
+                    No active operations
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Gamepad Tab -->
+    <div x-show="activeTab === 'gamepad'" class="space-y-6">
+        <div class="bg-white rounded-lg shadow p-6">
+            <h3 class="text-lg font-medium text-gray-900 mb-4">Gamepad Configuration</h3>
+            
+            <div class="mb-6">
+                <div class="w-full max-w-md mx-auto">
+                    <svg viewBox="0 0 600 400" class="w-full h-auto">
+                        <g id="gamepad-visual">
+                            <!-- Gamepad body -->
+                            <path d="M150 200 Q150 150 200 150 L400 150 Q450 150 450 200 L450 250 Q450 300 400 300 L200 300 Q150 300 150 250 Z" 
+                                  fill="#374151" stroke="#1f2937" stroke-width="2"/>
+                            
+                            <!-- D-Pad -->
+                            <rect x="180" y="180" width="20" height="60" fill="#6b7280" rx="2"/>
+                            <rect x="160" y="200" width="60" height="20" fill="#6b7280" rx="2"/>
+                            
+                            <!-- Buttons -->
+                            <circle cx="380" cy="190" r="15" fill="#ef4444" opacity="0.8"/> <!-- A -->
+                            <circle cx="410" cy="210" r="15" fill="#22c55e" opacity="0.8"/> <!-- B -->
+                            <circle cx="350" cy="210" r="15" fill="#3b82f6" opacity="0.8"/> <!-- X -->
+                            <circle cx="380" cy="230" r="15" fill="#f59e0b" opacity="0.8"/> <!-- Y -->
+                            
+                            <!-- Analog sticks -->
+                            <circle cx="250" cy="250" r="25" fill="#4b5563" stroke="#374151" stroke-width="2"/>
+                            <circle cx="250" cy="250" r="15" fill="#6b7280" :cx="250 + leftStickX * 10" :cy="250 + leftStickY * 10"/>
+                            
+                            <circle cx="350" cy="250" r="25" fill="#4b5563" stroke="#374151" stroke-width="2"/>
+                            <circle cx="350" cy="250" r="15" fill="#6b7280" :cx="350 + rightStickX * 10" :cy="350 + rightStickY * 10"/>
+                        </g>
+                    </svg>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div>
+                    <h4 class="font-medium text-gray-900 mb-3">Button Mappings</h4>
+                    <div class="space-y-3">
+                        <div class="flex items-center justify-between">
+                            <span class="text-sm text-gray-600">A Button:</span>
+                            <select x-model="gamepadMappings.a" class="text-sm border-gray-300 rounded-md">
+                                <option value="none">None</option>
+                                <option value="sync">Sync Current File</option>
+                                <option value="apply">Apply Templates</option>
+                                <option value="status">Check Status</option>
+                            </select>
+                        </div>
+                        <div class="flex items-center justify-between">
+                            <span class="text-sm text-gray-600">B Button:</span>
+                            <select x-model="gamepadMappings.b" class="text-sm border-gray-300 rounded-md">
+                                <option value="none">None</option>
+                                <option value="cancel">Cancel Operation</option>
+                                <option value="back">Go Back</option>
+                            </select>
+                        </div>
+                        <div class="flex items-center justify-between">
+                            <span class="text-sm text-gray-600">D-Pad:</span>
+                            <select x-model="gamepadMappings.dpad" class="text-sm border-gray-300 rounded-md">
+                                <option value="navigation">Navigate UI</option>
+                                <option value="files">Browse Files</option>
+                                <option value="groups">Browse Groups</option>
+                            </select>
+                        </div>
+                        <div class="flex items-center justify-between">
+                            <span class="text-sm text-gray-600">Left Stick:</span>
+                            <select x-model="gamepadMappings.leftStick" class="text-sm border-gray-300 rounded-md">
+                                <option value="scroll">Scroll</option>
+                                <option value="cursor">Move Cursor</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <div>
+                    <h4 class="font-medium text-gray-900 mb-3">Controller Status</h4>
+                    <div class="bg-gray-50 rounded-lg p-4">
+                        <template x-if="gamepadConnected">
+                            <div class="space-y-2 text-sm">
+                                <p><span class="text-gray-600">Controller:</span> <span x-text="gamepadName" class="font-medium"></span></p>
+                                <p><span class="text-gray-600">Buttons pressed:</span> <span x-text="activeButtons.join(', ') || 'None'" class="font-medium"></span></p>
+                                <p><span class="text-gray-600">Left stick:</span> <span x-text="`X: ${leftStickX.toFixed(2)}, Y: ${leftStickY.toFixed(2)}`" class="font-medium"></span></p>
+                                <p><span class="text-gray-600">Right stick:</span> <span x-text="`X: ${rightStickX.toFixed(2)}, Y: ${rightStickY.toFixed(2)}`" class="font-medium"></span></p>
+                            </div>
+                        </template>
+                        <template x-if="!gamepadConnected">
+                            <p class="text-gray-500">No controller connected</p>
+                        </template>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Enroll File Modal -->
+    <div x-show="showEnrollModal" x-cloak
+         class="fixed inset-0 bg-gray-500 bg-opacity-75 flex items-center justify-center z-50"
+         @click.away="showEnrollModal = false">
+        <div class="bg-white rounded-lg shadow-xl p-6 max-w-md w-full" @click.stop>
+            <h3 class="text-lg font-medium text-gray-900 mb-4">Enroll File</h3>
+            <form @submit.prevent="enrollFile()">
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">File Path</label>
+                        <input type="text" x-model="enrollForm.path" required
+                               class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Group</label>
+                        <input type="text" x-model="enrollForm.group" required
+                               class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Sync Action</label>
+                        <select x-model="enrollForm.action"
+                                class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                            <option value="converge">Converge</option>
+                            <option value="rollback">Rollback</option>
+                            <option value="freeze">Freeze</option>
+                            <option value="drift">Drift</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="flex items-center">
+                            <input type="checkbox" x-model="enrollForm.machineSpecific"
+                                   class="mr-2 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500">
+                            <span class="text-sm text-gray-700">Machine-specific enrollment</span>
+                        </label>
+                    </div>
+                </div>
+                <div class="mt-6 flex justify-end space-x-3">
+                    <button type="button" @click="showEnrollModal = false"
+                            class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">
+                        Cancel
+                    </button>
+                    <button type="submit"
+                            class="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700">
+                        Enroll
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}
