@@ -200,7 +200,7 @@ Normally, when you have both a machine template and a group template, Laszoo wil
 
 However, you may want to use the group template but have specific sections overridden by the machine template.
 
-To do this, place `{{ quack }}` in the group template where you want the machine template to override it. Then when enrolling the file, use --hybrid.
+To do this, place `{{ quack }}` in the group template where you want the machine template to override it. Then when enrolling the file, use `--hybrid`.
 
 In the machine template, simply place your [[x quack x]] tags in the same order that the original {{ quack }} tags appeared in the group template.
 
