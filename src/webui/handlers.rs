@@ -140,7 +140,7 @@ pub async fn enroll_file(
         false,
         None,
         None,
-    ) {
+    ).await {
         Ok(_) => {
             // Update UI state
             let mut ui_state = state.ui_state.write().await;

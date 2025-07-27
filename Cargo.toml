@@ -53,6 +53,8 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 dirs = "5.0"
 gethostname = "0.5"
 libc = "0.2"
+colored = "2.0"
+similar = "2.3"
 
 # Web UI
 axum = { version = "0.7", features = ["ws"] }

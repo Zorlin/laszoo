@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::collections::HashMap;
 use handlebars::Handlebars;
 use regex::Regex;
@@ -14,9 +13,62 @@ pub struct TemplateEngine {
 impl TemplateEngine {
     /// Merge file changes back to template while preserving variables
     pub fn merge_file_changes_to_template(&self, template_content: &str, file_content: &str) -> Result<String> {
-        // For now, just return the file content as the new template
-        // TODO: Implement intelligent merging that preserves {{ variables }} and [[x quack x]] tags
-        Ok(file_content.to_string())
+        // Extract all template variables and quack tags from the original template
+        let mut template_vars = HashMap::new();
+        let mut quack_tags = Vec::new();
+        
+        // Find all Handlebars variables in the template
+        let handlebars_regex = Regex::new(r"\{\{([^}]+)\}\}")
+            .map_err(|e| LaszooError::Template(format!("Invalid regex: {}", e)))?;
+        
+        for cap in handlebars_regex.captures_iter(template_content) {
+            if let (Some(full_match), Some(var_name)) = (cap.get(0), cap.get(1)) {
+                template_vars.insert(var_name.as_str().trim().to_string(), full_match.as_str().to_string());
+            }
+        }
+        
+        // Find all quack tags in the template
+        for cap in self.quack_regex.captures_iter(template_content) {
+            if let Some(full_match) = cap.get(0) {
+                quack_tags.push(full_match.as_str().to_string());
+            }
+        }
+        
+        // If no variables or quack tags found, just return the file content
+        if template_vars.is_empty() && quack_tags.is_empty() {
+            return Ok(file_content.to_string());
+        }
+        
+        // Try to preserve variables by finding their likely values in the file
+        let mut result = file_content.to_string();
+        
+        // For each template variable, try to find what value it was replaced with
+        for (var_name, var_template) in &template_vars {
+            // Skip if the variable is still in the file (wasn't processed)
+            if result.contains(var_template) {
+                continue;
+            }
+            
+            // For common variables, try to extract their current values and restore the template
+            match var_name.as_str() {
+                "hostname" => {
+                    // Try to find the hostname in the file and replace it back with the variable
+                    if let Ok(hostname) = gethostname::gethostname().into_string() {
+                        result = result.replace(&hostname, var_template);
+                    }
+                }
+                _ => {
+                    // For other variables, we'll need more context to determine their values
+                    // For now, we'll leave them as-is in the file
+                }
+            }
+        }
+        
+        // Restore quack tags if they were processed out
+        // This is complex because we need to identify which parts of the file
+        // came from quack tags, so for now we'll skip this
+        
+        Ok(result)
     }
 
     pub fn new() -> Result<Self> {

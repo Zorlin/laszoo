@@ -229,7 +229,13 @@ WantedBy=multi-user.target
         Ok(())
     }
     
-    fn start_service(&self) -> Result<()> {
+    pub fn start(&self) -> Result<()> {
+        if !self.is_root() {
+            return Err(LaszooError::Other(
+                "Starting service requires root privileges. Please run with sudo.".to_string()
+            ));
+        }
+        
         let output = Command::new("systemctl")
             .args(&["start", "laszoo.service"])
             .output()
@@ -241,16 +247,37 @@ WantedBy=multi-user.target
             ));
         }
         
+        println!("✓ Laszoo service started successfully");
         Ok(())
     }
     
-    fn stop_service(&self) -> Result<()> {
+    fn start_service(&self) -> Result<()> {
+        self.start()
+    }
+    
+    pub fn stop(&self) -> Result<()> {
+        if !self.is_root() {
+            return Err(LaszooError::Other(
+                "Stopping service requires root privileges. Please run with sudo.".to_string()
+            ));
+        }
+        
         let output = Command::new("systemctl")
             .args(&["stop", "laszoo.service"])
             .output()
             .map_err(|e| LaszooError::Other(format!("Failed to stop service: {}", e)))?;
         
-        // Ignore errors for stop - service might not be running
+        if !output.status.success() {
+            return Err(LaszooError::Other(
+                format!("Failed to stop service: {}", String::from_utf8_lossy(&output.stderr))
+            ));
+        }
+        
+        println!("✓ Laszoo service stopped successfully");
         Ok(())
+    }
+    
+    fn stop_service(&self) -> Result<()> {
+        self.stop()
     }
 }

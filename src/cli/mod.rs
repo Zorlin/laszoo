@@ -49,6 +49,10 @@ pub enum Commands {
         #[arg(long, conflicts_with = "machine")]
         hybrid: bool,
         
+        /// Disable automatic enrollment of new files in watched directories
+        #[arg(long)]
+        no_autoenroll: bool,
+        
         /// Command to run before applying changes
         #[arg(long, value_name = "COMMAND", alias = "start")]
         before: Option<String>,
@@ -154,16 +158,34 @@ pub enum Commands {
     
     /// Install packages on all systems in a group
     Install {
-        /// Group name to install packages in
-        group: String,
-        
-        /// Package names to install
-        #[arg(short, long, required = true)]
-        packages: Vec<String>,
+        /// Group name followed by package names to install
+        /// Example: laszoo install webservers nginx php mysql
+        #[arg(required = true, num_args = 2..)]
+        args: Vec<String>,
         
         /// Command to run after installing/updating each package
         #[arg(long)]
         after: Option<String>,
+    },
+    
+    /// Uninstall packages from all systems in a group
+    Uninstall {
+        /// Group name followed by package names to uninstall
+        /// Example: laszoo uninstall webservers nginx php
+        #[arg(required = true, num_args = 2..)]
+        args: Vec<String>,
+        
+        /// Command to run before uninstalling packages
+        #[arg(long)]
+        before: Option<String>,
+        
+        /// Command to run after uninstalling packages
+        #[arg(long)]
+        after: Option<String>,
+        
+        /// Purge packages (remove configuration files)
+        #[arg(long)]
+        purge: bool,
     },
     
     /// Apply package updates to all systems in a group
@@ -208,6 +230,25 @@ pub enum Commands {
         #[arg(short, long, default_value = "0.0.0.0")]
         bind: String,
     },
+    
+    /// Show differences between local files and templates
+    Diff {
+        /// Group name to check differences for
+        #[arg(short, long)]
+        group: Option<String>,
+        
+        /// Specific file to check (all files if not specified)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+        
+        /// Show unified diff output
+        #[arg(short, long)]
+        unified: bool,
+        
+        /// Context lines for unified diff
+        #[arg(short, long, default_value = "3")]
+        context: usize,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -232,6 +273,12 @@ pub enum ServiceCommands {
     
     /// Show status of the Laszoo service
     Status,
+    
+    /// Start the Laszoo service
+    Start,
+    
+    /// Stop the Laszoo service
+    Stop,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, Default)]

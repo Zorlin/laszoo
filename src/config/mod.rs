@@ -16,6 +16,14 @@ pub struct Config {
     #[serde(default = "default_auto_commit")]
     pub auto_commit: bool,
     
+    /// Auto-enroll files in watched directories
+    #[serde(default = "default_auto_enroll")]
+    pub auto_enroll: bool,
+    
+    /// Auto-upgrade when adding machine to group
+    #[serde(default = "default_auto_upgrade")]
+    pub auto_upgrade: bool,
+    
     /// Ollama API endpoint
     #[serde(default = "default_ollama_endpoint")]
     pub ollama_endpoint: String,
@@ -68,6 +76,8 @@ impl Default for Config {
             mfs_mount: default_mfs_mount(),
             default_sync_strategy: default_sync_strategy(),
             auto_commit: default_auto_commit(),
+            auto_enroll: default_auto_enroll(),
+            auto_upgrade: default_auto_upgrade(),
             ollama_endpoint: default_ollama_endpoint(),
             ollama_model: default_ollama_model(),
             monitoring: MonitoringConfig::default(),
@@ -154,6 +164,10 @@ impl Config {
             self.auto_commit = auto.parse().unwrap_or(self.auto_commit);
         }
         
+        if let Ok(auto) = std::env::var("LASZOO_AUTO_UPGRADE") {
+            self.auto_upgrade = auto.parse().unwrap_or(self.auto_upgrade);
+        }
+        
         if let Ok(endpoint) = std::env::var("LASZOO_OLLAMA_ENDPOINT") {
             self.ollama_endpoint = endpoint;
         }
@@ -202,6 +216,14 @@ fn default_sync_strategy() -> String {
 
 fn default_auto_commit() -> bool {
     true
+}
+
+fn default_auto_enroll() -> bool {
+    true
+}
+
+fn default_auto_upgrade() -> bool {
+    false
 }
 
 fn default_ollama_endpoint() -> String {

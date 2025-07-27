@@ -150,6 +150,16 @@ impl PackageManager {
             .join("packages.conf")
     }
 
+    /// Get the package operations for a group
+    pub fn get_group_packages(&self, group: &str) -> Result<Vec<PackageOperation>> {
+        let packages_path = self.get_group_packages_path(group);
+        if !packages_path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = std::fs::read_to_string(&packages_path)?;
+        self.parse_packages_conf(&content)
+    }
+    
     /// Parse a packages.conf file
     pub fn parse_packages_conf(&self, content: &str) -> Result<Vec<PackageOperation>> {
         let mut operations = Vec::new();
@@ -488,6 +498,54 @@ impl PackageManager {
         self.write_packages_conf(&packages_path, &existing_ops)?;
         
         info!("Added {} packages to group '{}'", packages.len(), group);
+        Ok(())
+    }
+    
+    /// Remove packages from a group's packages.conf
+    pub fn remove_packages_from_group(&self, group: &str, packages: &[String], purge: bool) -> Result<()> {
+        let packages_path = self.get_group_packages_path(group);
+        
+        // Load existing packages if file exists
+        let mut operations = if packages_path.exists() {
+            let content = std::fs::read_to_string(&packages_path)?;
+            self.parse_packages_conf(&content)?
+        } else {
+            // Create directory if needed
+            if let Some(parent) = packages_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            Vec::new()
+        };
+        
+        // For each package to uninstall, update or add the appropriate operation
+        for package in packages {
+            // Remove any existing entries for this package
+            operations.retain(|op| {
+                match op {
+                    PackageOperation::Upgrade { name, .. } |
+                    PackageOperation::Install { name } |
+                    PackageOperation::Keep { name } |
+                    PackageOperation::Remove { name } |
+                    PackageOperation::Purge { name } => name != package,
+                    _ => true,
+                }
+            });
+            
+            // Add the removal operation
+            if purge {
+                operations.push(PackageOperation::Purge { name: package.clone() });
+            } else {
+                operations.push(PackageOperation::Remove { name: package.clone() });
+            }
+        }
+        
+        // Write back to file
+        self.write_packages_conf(&packages_path, &operations)?;
+        
+        info!("Updated {} packages to {} in group '{}'", 
+              packages.len(), 
+              if purge { "purge" } else { "remove" }, 
+              group);
         Ok(())
     }
 

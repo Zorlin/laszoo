@@ -2,6 +2,8 @@
 
 *action follows intention*
 
+![logo.png](logo.png)
+
 Laszoo is a distributed configuration management tool that leverages MooseFS or CephFS for zero-config clustering and automatic synchronization of configuration files across hosts.
 
 ## Architecture

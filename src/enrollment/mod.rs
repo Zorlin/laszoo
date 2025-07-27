@@ -5,6 +5,8 @@ use serde::{Serialize, Deserialize};
 use tracing::{info, debug, warn};
 use crate::error::{LaszooError, Result};
 use crate::action::{ActionManager, ActionPhase};
+use crate::git::GitManager;
+use crate::config::Config;
 use sha2::{Sha256, Digest};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +83,9 @@ impl EnrollmentManifest {
 pub struct EnrollmentManager {
     mfs_mount: PathBuf,
     hostname: String,
+    git_manager: GitManager,
+    config: Config,
+    no_autoenroll: bool,
 }
 
 impl EnrollmentManager {
@@ -88,11 +93,37 @@ impl EnrollmentManager {
         let hostname = gethostname::gethostname()
             .to_string_lossy()
             .to_string();
+        
+        let git_manager = GitManager::new(mfs_mount.clone());
+        let config = Config::default(); // This will be overridden in from_config
             
         Self {
             mfs_mount,
             hostname,
+            git_manager,
+            config,
+            no_autoenroll: false,
         }
+    }
+    
+    pub fn from_config(config: Config) -> Self {
+        let hostname = gethostname::gethostname()
+            .to_string_lossy()
+            .to_string();
+        
+        let git_manager = GitManager::new(config.mfs_mount.clone());
+            
+        Self {
+            mfs_mount: config.mfs_mount.clone(),
+            hostname,
+            git_manager,
+            config,
+            no_autoenroll: false,
+        }
+    }
+    
+    pub fn set_no_autoenroll(&mut self, no_autoenroll: bool) {
+        self.no_autoenroll = no_autoenroll;
     }
 
     pub fn manifest_path(&self) -> PathBuf {
@@ -122,7 +153,7 @@ impl EnrollmentManager {
     }
 
     /// Enroll a file or directory into a group
-    pub fn enroll_path(&self, group: &str, path: Option<&Path>, force: bool, machine_specific: bool, hybrid: bool, before: Option<String>, after: Option<String>) -> Result<()> {
+    pub async fn enroll_path(&self, group: &str, path: Option<&Path>, force: bool, machine_specific: bool, hybrid: bool, before: Option<String>, after: Option<String>) -> Result<()> {
         // If no path specified, enroll the machine into the group
         if path.is_none() {
             return self.enroll_machine_to_group(group);
@@ -138,9 +169,9 @@ impl EnrollmentManager {
         }
 
         if path.is_file() {
-            self.enroll_file(path, group, force, machine_specific, hybrid, before, after)
+            self.enroll_file(path, group, force, machine_specific, hybrid, before, after).await
         } else if path.is_dir() {
-            self.enroll_directory(path, group, force, machine_specific, hybrid, before, after)
+            self.enroll_directory(path, group, force, machine_specific, hybrid, before, after).await
         } else {
             Err(LaszooError::InvalidPath { 
                 path: path.to_path_buf() 
@@ -149,7 +180,7 @@ impl EnrollmentManager {
     }
 
     /// Enroll a file into a group
-    pub fn enroll_file(&self, file_path: &Path, group: &str, force: bool, machine_specific: bool, hybrid: bool, before: Option<String>, after: Option<String>) -> Result<()> {
+    pub async fn enroll_file(&self, file_path: &Path, group: &str, force: bool, machine_specific: bool, hybrid: bool, before: Option<String>, after: Option<String>) -> Result<()> {
         // First ensure this machine is in the group
         self.add_machine_to_group(group)?;
         
@@ -195,11 +226,11 @@ impl EnrollmentManager {
         }
         
         // Not within any enrolled directory, proceed with normal enrollment
-        self.enroll_file_with_dir(file_path, group, force, machine_specific, hybrid, None, before, after)
+        self.enroll_file_with_dir(file_path, group, force, machine_specific, hybrid, None, before, after).await
     }
     
     /// Enroll a file into a group with optional directory tracking
-    fn enroll_file_with_dir(&self, file_path: &Path, group: &str, force: bool, machine_specific: bool, hybrid: bool, enrolled_directory: Option<&Path>, before: Option<String>, after: Option<String>) -> Result<()> {
+    async fn enroll_file_with_dir(&self, file_path: &Path, group: &str, force: bool, machine_specific: bool, hybrid: bool, enrolled_directory: Option<&Path>, before: Option<String>, after: Option<String>) -> Result<()> {
         // Check permissions
         if let Err(_) = fs::metadata(file_path) {
             return Err(LaszooError::PermissionDenied { 
@@ -330,11 +361,42 @@ impl EnrollmentManager {
             }
         }
         
+        // Auto-commit if enabled
+        if self.config.auto_commit {
+            // Get the template path based on enrollment type
+            let template_path = if machine_specific || hybrid {
+                // Machine-specific template path
+                let mut machine_template_path = crate::fs::get_machine_file_path(
+                    &self.mfs_mount,
+                    "",
+                    &self.hostname,
+                    &abs_path
+                )?;
+                let filename = machine_template_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                machine_template_path.set_file_name(format!("{}.lasz", filename));
+                machine_template_path
+            } else {
+                // Group template path
+                crate::fs::get_group_template_path(
+                    &self.mfs_mount, 
+                    "", 
+                    group,
+                    &abs_path
+                )?
+            };
+            
+            let paths = vec![template_path.clone()];
+            let action = format!("Enrolled {} into group {}", abs_path.display(), group);
+            self.commit_enrollment_changes(&action, paths, group).await?;
+        }
+        
         Ok(())
     }
 
     /// Enroll a directory recursively
-    fn enroll_directory(&self, dir_path: &Path, group: &str, force: bool, machine_specific: bool, hybrid: bool, before: Option<String>, after: Option<String>) -> Result<()> {
+    async fn enroll_directory(&self, dir_path: &Path, group: &str, force: bool, machine_specific: bool, hybrid: bool, before: Option<String>, after: Option<String>) -> Result<()> {
         // First ensure this machine is in the group
         self.add_machine_to_group(group)?;
         
@@ -403,6 +465,11 @@ impl EnrollmentManager {
             info!("Successfully enrolled directory {:?} into group '{}'", abs_path, group);
         }
         
+        // Track which files were created or changed
+        let mut created_files = Vec::new();
+        let mut changed_files = Vec::new();
+        let mut directory_already_enrolled = false;
+        
         // Now copy all existing files in the directory to templates
         for entry in walkdir::WalkDir::new(&abs_path) {
             let entry = entry?;
@@ -423,11 +490,23 @@ impl EnrollmentManager {
                     fs::create_dir_all(parent)?;
                 }
                 
-                // Create template if it doesn't exist
-                if !group_template_path.exists() {
+                // Check if template already exists
+                if group_template_path.exists() {
+                    directory_already_enrolled = true;
+                    // Compare content
+                    let existing_content = fs::read_to_string(&group_template_path)?;
+                    if existing_content != content {
+                        fs::write(&group_template_path, &content)?;
+                        self.copy_metadata(file_path, &group_template_path)?;
+                        changed_files.push(group_template_path);
+                        debug!("Updated template for directory file: {:?}", file_path);
+                    }
+                } else {
+                    // Create new template
                     fs::write(&group_template_path, &content)?;
                     self.copy_metadata(file_path, &group_template_path)?;
-                    debug!("Created template for directory file: {:?}", group_template_path);
+                    created_files.push(group_template_path);
+                    debug!("Created template for directory file: {:?}", file_path);
                 }
             }
         }
@@ -440,6 +519,25 @@ impl EnrollmentManager {
             } else {
                 action_manager.set_group_actions(group, &abs_path, before, after)?;
             }
+        }
+        
+        // Auto-commit if enabled
+        if self.config.auto_commit {
+            // Determine what to commit based on the rules:
+            // 1. If directory already enrolled and only some files changed, commit only changes
+            // 2. If directory is new, commit all created files
+            if directory_already_enrolled && !changed_files.is_empty() {
+                // Directory was already enrolled by other nodes, only commit changes
+                let action = format!("Updated {} file(s) in enrolled directory {} for group {}", 
+                    changed_files.len(), abs_path.display(), group);
+                self.commit_enrollment_changes(&action, changed_files, group).await?;
+            } else if !created_files.is_empty() {
+                // New directory enrollment, commit all created files
+                let action = format!("Enrolled directory {} with {} file(s) into group {}", 
+                    abs_path.display(), created_files.len(), group);
+                self.commit_enrollment_changes(&action, created_files, group).await?;
+            }
+            // If directory was already enrolled and no files changed, don't commit
         }
         
         Ok(())
@@ -894,6 +992,141 @@ impl EnrollmentManager {
                   uid, gid, to);
         }
         
+        Ok(())
+    }
+    
+    /// Commit enrollment changes if auto-commit is enabled
+    async fn commit_enrollment_changes(&self, action: &str, paths: Vec<PathBuf>, group: &str) -> Result<()> {
+        if !self.config.auto_commit {
+            return Ok(());
+        }
+        
+        // Initialize git repo if needed
+        self.git_manager.init_repo()?;
+        
+        // Stage the changes
+        self.git_manager.stage_files(&paths)?;
+        
+        // Generate commit context
+        let context = format!("{} for group '{}'", action, group);
+        
+        // Try to commit with AI-generated message
+        match self.git_manager.commit_with_ai(
+            &self.config.ollama_endpoint,
+            &self.config.ollama_model,
+            Some(&context)
+        ).await {
+            Ok(oid) => {
+                info!("Created commit {} for enrollment changes", oid);
+                Ok(())
+            }
+            Err(e) => {
+                warn!("Failed to create commit: {}", e);
+                Err(e)
+            }
+        }
+    }
+    
+    /// Check if templates have changed when enrolling a directory
+    fn check_directory_template_changes(&self, dir_path: &Path, group: &str) -> Result<Vec<PathBuf>> {
+        let mut changed_files = Vec::new();
+        let abs_path = dir_path.canonicalize()?;
+        
+        // Walk through all files in the directory
+        for entry in walkdir::WalkDir::new(&abs_path) {
+            let entry = entry?;
+            if entry.file_type().is_file() {
+                let file_path = entry.path();
+                let group_template_path = crate::fs::get_group_template_path(
+                    &self.mfs_mount, 
+                    "", 
+                    group,
+                    file_path
+                )?;
+                
+                if group_template_path.exists() {
+                    // Compare checksums
+                    let local_content = fs::read_to_string(file_path)?;
+                    let template_content = fs::read_to_string(&group_template_path)?;
+                    
+                    if local_content != template_content {
+                        changed_files.push(group_template_path);
+                    }
+                } else {
+                    // New file that will be created
+                    changed_files.push(group_template_path);
+                }
+            }
+        }
+        
+        Ok(changed_files)
+    }
+    
+    /// Check if a file is within any enrolled directory
+    pub fn is_file_within_enrolled_directory(&self, file_path: &Path) -> Result<Option<(String, PathBuf)>> {
+        let abs_path = file_path.canonicalize()?;
+        
+        // Check machine manifest
+        let manifest = self.load_manifest()?;
+        for (_, entry) in &manifest.entries {
+            if let Some(enrolled_dir) = &entry.enrolled_directory {
+                if abs_path.starts_with(enrolled_dir) {
+                    return Ok(Some((entry.group.clone(), enrolled_dir.clone())));
+                }
+            }
+        }
+        
+        // Check group manifests
+        let groups_file = self.mfs_mount
+            .join("machines")
+            .join(&self.hostname)
+            .join("etc")
+            .join("laszoo")
+            .join("groups.conf");
+        
+        if groups_file.exists() {
+            let groups: Vec<String> = fs::read_to_string(&groups_file)?
+                .lines()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            
+            for group in groups {
+                if let Ok(group_manifest) = self.load_group_manifest(&group) {
+                    for (_, entry) in &group_manifest.entries {
+                        if let Some(enrolled_dir) = &entry.enrolled_directory {
+                            if abs_path.starts_with(enrolled_dir) {
+                                return Ok(Some((group.clone(), enrolled_dir.clone())));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+    
+    /// Auto-enroll a file in a watched directory
+    pub async fn auto_enroll_file(&self, file_path: &Path, group: &str, enrolled_directory: &Path) -> Result<()> {
+        info!("Auto-enrolling new file {:?} in watched directory {:?}", file_path, enrolled_directory);
+        
+        // Check if auto-enrollment is disabled
+        if self.no_autoenroll {
+            info!("Auto-enrollment disabled. File {:?} will not be automatically enrolled.", file_path);
+            return Ok(());
+        }
+        
+        // Check if using the global auto_enroll config setting
+        if !self.config.auto_enroll {
+            info!("Auto-enrollment disabled in config. File {:?} will not be automatically enrolled.", file_path);
+            return Ok(());
+        }
+        
+        // Enroll the file
+        self.enroll_file_with_dir(file_path, group, false, false, false, Some(enrolled_directory), None, None).await?;
+        
+        info!("Successfully auto-enrolled {:?} into group '{}'", file_path, group);
         Ok(())
     }
 }

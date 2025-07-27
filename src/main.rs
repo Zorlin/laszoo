@@ -56,8 +56,8 @@ async fn main() -> Result<()> {
         Commands::Commit { message, all } => {
             commit_changes(&config, message.as_deref(), all).await?;
         }
-        Commands::Enroll { group, paths, force, include_hidden, machine, hybrid, before, after, action } => {
-            enroll_files(&config, &group, paths, force, include_hidden, machine, hybrid, before, after, action).await?;
+        Commands::Enroll { group, paths, force, include_hidden, machine, hybrid, no_autoenroll, before, after, action } => {
+            enroll_files(&config, &group, paths, force, include_hidden, machine, hybrid, no_autoenroll, before, after, action).await?;
         }
         Commands::Unenroll { group, paths } => {
             unenroll_files(&config, group, paths).await?;
@@ -82,8 +82,21 @@ async fn main() -> Result<()> {
         Commands::Watch { group, interval, auto, hard } => {
             watch_for_changes(&config, group.as_deref(), interval, auto, hard).await?;
         }
-        Commands::Install { group, packages, after } => {
-            install_packages(&config, &group, packages, after.as_deref()).await?;
+        Commands::Install { args, after } => {
+            if args.len() < 2 {
+                return Err(LaszooError::Other("Usage: laszoo install <group> <package1> [package2] ...".to_string()));
+            }
+            let group = &args[0];
+            let packages = args[1..].to_vec();
+            install_packages(&config, group, packages, after.as_deref()).await?;
+        }
+        Commands::Uninstall { args, before, after, purge } => {
+            if args.len() < 2 {
+                return Err(LaszooError::Other("Usage: laszoo uninstall <group> <package1> [package2] ...".to_string()));
+            }
+            let group = &args[0];
+            let packages = args[1..].to_vec();
+            uninstall_packages(&config, group, packages, before.as_deref(), after.as_deref(), purge).await?;
         }
         Commands::Patch { group, before, after, rolling, full_upgrade, dist_upgrade } => {
             patch_group(&config, &group, before.as_deref(), after.as_deref(), rolling, full_upgrade, dist_upgrade).await?;
@@ -95,6 +108,9 @@ async fn main() -> Result<()> {
             let webui = crate::webui::WebUI::new(std::sync::Arc::new(config));
             info!("Starting Laszoo Web UI on http://0.0.0.0:{}", port);
             webui.start(port).await?;
+        }
+        Commands::Diff { group, file, unified, context } => {
+            show_diff(&config, group.as_deref(), file.as_deref(), unified, context).await?;
         }
     }
 
@@ -197,6 +213,7 @@ async fn enroll_files(
     _include_hidden: bool,
     machine: bool,
     hybrid: bool,
+    no_autoenroll: bool,
     before: Option<String>,
     after: Option<String>,
     action: crate::cli::SyncAction
@@ -207,14 +224,12 @@ async fn enroll_files(
     crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
 
     // Create enrollment manager
-    let manager = EnrollmentManager::new(
-        config.mfs_mount.clone(),
-        "".to_string()
-    );
+    let mut manager = EnrollmentManager::from_config(config.clone());
+    manager.set_no_autoenroll(no_autoenroll);
 
     // If no paths provided, enroll the machine into the group
     if paths.is_empty() {
-        manager.enroll_path(group, None, force, machine, hybrid, before.clone(), after.clone())?;
+        manager.enroll_path(group, None, force, machine, hybrid, before.clone(), after.clone()).await?;
         info!("Successfully enrolled machine into group '{}'", group);
 
         // Update manifest with sync action and triggers if provided
@@ -229,7 +244,7 @@ async fn enroll_files(
     let mut error_count = 0;
 
     for path in paths {
-        match manager.enroll_path(group, Some(&path), force, machine, hybrid, before.clone(), after.clone()) {
+        match manager.enroll_path(group, Some(&path), force, machine, hybrid, before.clone(), after.clone()).await {
             Ok(_) => {
                 info!("Enrolled: {:?}", path);
                 enrolled_count += 1;
@@ -1183,6 +1198,37 @@ async fn handle_group_command(group_name: &str, command: GroupCommands) -> Resul
             update_machine_groups(&config.mfs_mount, &machine_name, group_name, true)?;
 
             println!("Successfully added machine '{}' to group '{}'", machine_name, group_name);
+            
+            // Check if we're adding the current machine and if there are pending upgrades
+            let current_hostname = gethostname::gethostname().to_string_lossy().to_string();
+            if machine_name == current_hostname {
+                // Check for pending package operations in this group
+                let package_manager = crate::package::PackageManager::new(config.mfs_mount.clone());
+                if let Ok(operations) = package_manager.get_group_packages(group_name) {
+                    if !operations.is_empty() {
+                        println!("\nDetected {} pending package operations for group '{}'", operations.len(), group_name);
+                        println!("Run 'laszoo patch {}' to apply updates", group_name);
+                        
+                        // Check if any are upgrade operations
+                        let has_upgrades = operations.iter().any(|op| matches!(op, 
+                            crate::package::PackageOperation::UpgradeAll { .. } |
+                            crate::package::PackageOperation::DistUpgradeAll { .. } |
+                            crate::package::PackageOperation::FullUpgradeAll { .. }
+                        ));
+                        
+                        if has_upgrades && config.auto_upgrade {
+                            println!("\nAuto-upgrade is enabled. Running pending upgrades...");
+                            // Apply the package operations
+                            if let Err(e) = apply_packages_for_group(&config, group_name).await {
+                                warn!("Failed to auto-apply package upgrades: {}", e);
+                                println!("Warning: Failed to auto-apply upgrades: {}", e);
+                            } else {
+                                println!("✓ Successfully applied pending upgrades");
+                            }
+                        }
+                    }
+                }
+            }
         }
         GroupCommands::Remove { machine, keep } => {
             let machine_name = machine.unwrap_or_else(|| {
@@ -1510,10 +1556,7 @@ fn list_machines_in_group(mfs_mount: &Path, group_name: &str) -> Result<Vec<Stri
     Ok(machines)
 }
 async fn watch_for_changes(config: &Config, group: Option<&str>, _interval: u64, auto: bool, hard: bool) -> Result<()> {
-    use notify::{Watcher, RecursiveMode, Event, EventKind};
-    use std::sync::mpsc::channel;
     use std::time::Duration;
-    use std::collections::HashSet;
 
     info!("Starting watch mode for group: {:?}, auto: {}", group, auto);
 
@@ -2070,27 +2113,72 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
                                     debug!("Processing file: {} (exists: {}, hard: {})", 
                                         path.display(), path.exists(), hard);
                                     
-                                    match handle_file_change(
-                                        &enrollment_manager,
-                                        path,
-                                        &group_name,
-                                        &sync_action,
-                                        hard,
-                                    ).await {
-                                        Ok(template_changed) => {
-                                            if template_changed {
-                                                println!("✓ Updated template for {}", path.display());
-
-                                                // Track that this template change originated from local file change
-                                                let template_path = enrollment_manager.get_group_template_path(&group_name, path)?;
-                                                local_template_changes.insert(template_path);
+                                    // Check if this is a new file that needs auto-enrollment
+                                    let template_path = enrollment_manager.get_group_template_path(&group_name, path)?;
+                                    let needs_enrollment = path.exists() && !template_path.exists();
+                                    
+                                    // Check if it's within an enrolled directory for auto-enrollment
+                                    let within_enrolled_dir = if needs_enrollment {
+                                        enrollment_manager.is_file_within_enrolled_directory(path)?
+                                    } else {
+                                        None
+                                    };
+                                    
+                                    if needs_enrollment && within_enrolled_dir.is_some() {
+                                        let (found_group, enrolled_dir) = within_enrolled_dir.unwrap();
+                                        
+                                        // Only auto-enroll if it's in the same group
+                                        if found_group == group_name {
+                                            // Check auto-enrollment settings
+                                            let should_auto_enroll = if hard {
+                                                // In hard mode, always auto-enroll
+                                                true
                                             } else {
-                                                debug!("No template update needed/performed for {}", path.display());
+                                                // In soft mode, just discover but don't enroll
+                                                false
+                                            };
+                                            
+                                            if should_auto_enroll {
+                                                println!("  → Auto-enrolling new file: {}", path.display());
+                                                match enrollment_manager.auto_enroll_file(path, &group_name, &enrolled_dir).await {
+                                                    Ok(()) => {
+                                                        println!("  ✓ Auto-enrolled file: {}", path.display());
+                                                        // Track this template change for committing
+                                                        local_template_changes.insert(template_path);
+                                                    }
+                                                    Err(e) => {
+                                                        error!("Failed to auto-enroll file {}: {}", path.display(), e);
+                                                        println!("  ✗ Failed to auto-enroll: {}", e);
+                                                    }
+                                                }
+                                            } else {
+                                                println!("  → Discovered new file (soft mode): {}", path.display());
                                             }
                                         }
-                                        Err(e) => {
-                                            error!("Failed to handle change for {}: {}", path.display(), e);
-                                            println!("✗ Failed to handle change for {}: {}", path.display(), e);
+                                    } else {
+                                        // Handle normal file change
+                                        match handle_file_change(
+                                            &enrollment_manager,
+                                            path,
+                                            &group_name,
+                                            &sync_action,
+                                            hard,
+                                        ).await {
+                                            Ok(template_changed) => {
+                                                if template_changed {
+                                                    println!("✓ Updated template for {}", path.display());
+
+                                                    // Track that this template change originated from local file change
+                                                    let template_path = enrollment_manager.get_group_template_path(&group_name, path)?;
+                                                    local_template_changes.insert(template_path);
+                                                } else {
+                                                    debug!("No template update needed/performed for {}", path.display());
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to handle change for {}: {}", path.display(), e);
+                                                println!("✗ Failed to handle change for {}: {}", path.display(), e);
+                                            }
                                         }
                                     }
                                 }
@@ -2697,6 +2785,102 @@ async fn install_packages(config: &Config, group: &str, packages: Vec<String>, a
     Ok(())
 }
 
+async fn uninstall_packages(config: &Config, group: &str, packages: Vec<String>, before: Option<&str>, after: Option<&str>, purge: bool) -> Result<()> {
+    use crate::package::PackageManager;
+    
+    info!("Uninstalling packages from group '{}'", group);
+    
+    // Ensure distributed filesystem is available
+    crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
+    
+    // Create package manager
+    let pkg_manager = PackageManager::new(config.mfs_mount.clone());
+    
+    // Remove packages from group's packages.conf
+    pkg_manager.remove_packages_from_group(group, &packages, purge)?;
+    
+    // Get current hostname
+    let hostname = gethostname::gethostname()
+        .to_string_lossy()
+        .to_string();
+    
+    // Check if this machine is in the group
+    let groups_file = config.mfs_mount
+        .join("machines")
+        .join(&hostname)
+        .join("etc")
+        .join("laszoo")
+        .join("groups.conf");
+    
+    let in_group = if groups_file.exists() {
+        let content = std::fs::read_to_string(&groups_file)?;
+        content.lines()
+            .any(|line| line.trim() == group)
+    } else {
+        false
+    };
+    
+    if !in_group {
+        println!("This machine is not in group '{}', skipping local uninstall", group);
+        println!("Successfully updated package configuration for group '{}'", group);
+        for package in &packages {
+            println!("  - {}", package);
+        }
+        return Ok(());
+    }
+    
+    // Run before command if provided
+    if let Some(cmd) = before {
+        info!("Running before command: {}", cmd);
+        use tokio::process::Command;
+        
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output()
+            .await?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!("Before command failed: {}", stderr);
+        }
+    }
+    
+    // Uninstall packages locally
+    info!("Uninstalling packages locally");
+    let pkg_ops: Vec<crate::package::PackageOperation> = packages.iter()
+        .map(|pkg| crate::package::PackageOperation::Remove {
+            name: pkg.clone(),
+        })
+        .collect();
+    
+    pkg_manager.apply_operations_with_group(&pkg_ops, Some(group)).await?;
+    
+    // Run after command if provided
+    if let Some(cmd) = after {
+        info!("Running after command: {}", cmd);
+        use tokio::process::Command;
+        
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output()
+            .await?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!("After command failed: {}", stderr);
+        }
+    }
+    
+    println!("Successfully uninstalled packages from group '{}'", group);
+    for package in &packages {
+        println!("  - {}", package);
+    }
+    
+    Ok(())
+}
+
 async fn check_for_unexecuted_commands(config: &Config, group: &str) -> bool {
     use crate::package::PackageManager;
     use std::collections::HashSet;
@@ -2962,6 +3146,260 @@ async fn handle_service_command(command: crate::cli::ServiceCommands) -> Result<
         ServiceCommands::Status => {
             service_manager.status()?;
         }
+        ServiceCommands::Start => {
+            service_manager.start()?;
+        }
+        ServiceCommands::Stop => {
+            service_manager.stop()?;
+        }
+    }
+    
+    Ok(())
+}
+
+async fn show_diff(config: &Config, group: Option<&str>, file: Option<&Path>, unified: bool, context: usize) -> Result<()> {
+    use colored::*;
+    use similar::{ChangeTag, TextDiff};
+    use crate::enrollment::EnrollmentManager;
+    use crate::template::TemplateEngine;
+    
+    // Ensure distributed filesystem is available
+    crate::fs::ensure_distributed_fs_available(&config.mfs_mount)?;
+    
+    let hostname = gethostname::gethostname()
+        .to_string_lossy()
+        .to_string();
+    
+    let enrollment_manager = EnrollmentManager::new(
+        config.mfs_mount.clone(),
+        hostname.clone(),
+    );
+    
+    // Get enrolled files to check
+    let mut files_to_check = Vec::new();
+    
+    if let Some(specific_file) = file {
+        // Check specific file
+        files_to_check.push(specific_file.to_path_buf());
+    } else {
+        // Get all enrolled files for the machine
+        let machine_manifest = enrollment_manager.load_manifest()?;
+        
+        if let Some(specific_group) = group {
+            // Filter by group
+            for (_, entry) in &machine_manifest.entries {
+                if entry.group == specific_group {
+                    files_to_check.push(entry.original_path.clone());
+                }
+            }
+        } else {
+            // All enrolled files
+            for (_, entry) in &machine_manifest.entries {
+                files_to_check.push(entry.original_path.clone());
+            }
+        }
+        
+        // Also check group manifests
+        if group.is_none() {
+            // Get all groups this machine is in
+            let groups_file = config.mfs_mount
+                .join("machines")
+                .join(&hostname)
+                .join("etc")
+                .join("laszoo")
+                .join("groups.conf");
+            
+            if groups_file.exists() {
+                let content = std::fs::read_to_string(&groups_file)?;
+                for group_name in content.lines() {
+                    let group_name = group_name.trim();
+                    if !group_name.is_empty() {
+                        // Load group manifest
+                        let group_manifest_path = config.mfs_mount
+                            .join("groups")
+                            .join(group_name)
+                            .join("manifest.json");
+                        
+                        if group_manifest_path.exists() {
+                            if let Ok(group_manifest) = enrollment_manager.load_group_manifest(group_name) {
+                                for (_, entry) in &group_manifest.entries {
+                                    if !files_to_check.contains(&entry.original_path) {
+                                        files_to_check.push(entry.original_path.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(specific_group) = group {
+            // Load specific group manifest
+            if let Ok(group_manifest) = enrollment_manager.load_group_manifest(specific_group) {
+                for (_, entry) in &group_manifest.entries {
+                    if !files_to_check.contains(&entry.original_path) {
+                        files_to_check.push(entry.original_path.clone());
+                    }
+                }
+            }
+        }
+    }
+    
+    if files_to_check.is_empty() {
+        println!("No enrolled files found to compare");
+        return Ok(());
+    }
+    
+    // Sort files for consistent output
+    files_to_check.sort();
+    
+    let mut has_differences = false;
+    
+    for file_path in files_to_check {
+        // Check if file exists locally
+        let local_content = if file_path.exists() {
+            match std::fs::read_to_string(&file_path) {
+                Ok(content) => Some(content),
+                Err(e) => {
+                    eprintln!("Error reading {}: {}", file_path.display(), e);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        
+        // Find the template for this file - check both machine and group templates
+        let template_path = {
+            // First check if there's a machine-specific entry
+            let machine_manifest = enrollment_manager.load_manifest()?;
+            let mut found_template = None;
+            
+            // Check machine manifest for this file
+            if let Some(entry) = machine_manifest.entries.get(&file_path) {
+                if let Some(ref tpl_path) = entry.template_path {
+                    if tpl_path.exists() {
+                        found_template = Some(tpl_path.clone());
+                    }
+                }
+            }
+            
+            // If not found in machine manifest, check group templates
+            if found_template.is_none() {
+                // Get all groups this machine is in
+                let groups_file = config.mfs_mount
+                    .join("machines")
+                    .join(&hostname)
+                    .join("etc")
+                    .join("laszoo")
+                    .join("groups.conf");
+                
+                if groups_file.exists() {
+                    let content = std::fs::read_to_string(&groups_file)?;
+                    for group_name in content.lines() {
+                        let group_name = group_name.trim();
+                        if !group_name.is_empty() {
+                            if let Ok(tpl_path) = enrollment_manager.get_group_template_path(group_name, &file_path) {
+                                if tpl_path.exists() {
+                                    found_template = Some(tpl_path);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            match found_template {
+                Some(path) => path,
+                None => continue,
+            }
+        };
+        
+        // Read and process template
+        let template_content = match std::fs::read_to_string(&template_path) {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("Error reading template {}: {}", template_path.display(), e);
+                continue;
+            }
+        };
+        
+        // Process template to get the expected content
+        let template_engine = TemplateEngine::new()?;
+        let mut variables = HashMap::new();
+        variables.insert("hostname".to_string(), serde_json::Value::String(hostname.clone()));
+        
+        let expected_content = match template_engine.process_template(&template_content, &variables, false) {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("Error processing template for {}: {}", file_path.display(), e);
+                continue;
+            }
+        };
+        
+        // Compare contents
+        let local_content_ref = local_content.as_deref().unwrap_or("");
+        
+        if local_content_ref != expected_content.as_str() {
+            has_differences = true;
+            
+            if unified {
+                // Show unified diff
+                println!("{}", format!("--- {}", template_path.display()).red());
+                println!("{}", format!("+++ {}", file_path.display()).green());
+                
+                let diff = TextDiff::from_lines(expected_content.as_str(), local_content_ref);
+                
+                for hunk in diff.unified_diff().context_radius(context).iter_hunks() {
+                    println!("{}", hunk.header().to_string().cyan());
+                    for change in hunk.iter_changes() {
+                        let sign = match change.tag() {
+                            ChangeTag::Delete => "-",
+                            ChangeTag::Insert => "+",
+                            ChangeTag::Equal => " ",
+                        };
+                        
+                        let line = change.to_string();
+                        let line = line.trim_end();
+                        
+                        match change.tag() {
+                            ChangeTag::Delete => print!("{}", format!("{}{}", sign, line).red()),
+                            ChangeTag::Insert => print!("{}", format!("{}{}", sign, line).green()),
+                            ChangeTag::Equal => print!("{}{}", sign, line),
+                        }
+                        
+                        if !change.missing_newline() {
+                            println!();
+                        }
+                    }
+                }
+                println!();
+            } else {
+                // Simple diff summary
+                println!("{} {}", "Modified:".yellow(), file_path.display());
+                
+                let diff = TextDiff::from_lines(expected_content.as_str(), local_content_ref);
+                let mut inserts = 0;
+                let mut deletes = 0;
+                
+                for change in diff.iter_all_changes() {
+                    match change.tag() {
+                        ChangeTag::Insert => inserts += 1,
+                        ChangeTag::Delete => deletes += 1,
+                        _ => {}
+                    }
+                }
+                
+                println!("  {} additions, {} deletions", 
+                    format!("+{}", inserts).green(),
+                    format!("-{}", deletes).red()
+                );
+            }
+        }
+    }
+    
+    if !has_differences {
+        println!("All files are synchronized with their templates");
     }
     
     Ok(())
