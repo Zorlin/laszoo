@@ -1,6 +1,3 @@
-use laszoo::config::Config;
-use laszoo::enrollment::EnrollmentManager;
-use laszoo::template::TemplateEngine;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -12,21 +9,21 @@ use common::TestEnvironment;
 #[tokio::test]
 async fn test_watch_detects_local_changes() {
     let env = TestEnvironment::new("watch_local");
-    let config = env.create_config();
+    env.setup_git().expect("Failed to setup git");
     
     // Create a test file
     let test_file = env.test_dir.join("config.txt");
     fs::write(&test_file, "initial content").unwrap();
     
     // Enroll the file
-    let mut enrollment_manager = EnrollmentManager::new(config.clone());
-    enrollment_manager.enroll_file("testgroup", &test_file, false, false, None, None, Default::default()).await.unwrap();
+    let output = env.run_laszoo(&["enroll", "testgroup", test_file.to_str().unwrap()]).unwrap();
+    assert!(output.status.success());
     
     // Start watch in background (would normally block)
     // For testing, we'll just verify the setup
     
     // Verify template was created
-    let template_path = config.mfs_mount.join("groups/testgroup").join(format!("{}.lasz", test_file.display()));
+    let template_path = env.mfs_mount.join("groups/testgroup").join(format!("{}.lasz", test_file.display()));
     assert!(template_path.exists());
     
     // Simulate local file change
@@ -43,17 +40,18 @@ async fn test_watch_detects_local_changes() {
 #[tokio::test]
 async fn test_watch_detects_template_changes() {
     let env = TestEnvironment::new("watch_template");
-    let config = env.create_config();
+    env.setup_git().expect("Failed to setup git");
     
     // Create and enroll a test file
     let test_file = env.test_dir.join("config.txt");
     fs::write(&test_file, "initial content").unwrap();
     
-    let mut enrollment_manager = EnrollmentManager::new(config.clone());
-    enrollment_manager.enroll_file("testgroup", &test_file, false, false, None, None, Default::default()).await.unwrap();
+    // Enroll using CLI
+    let output = env.run_laszoo(&["enroll", "testgroup", test_file.to_str().unwrap()]).unwrap();
+    assert!(output.status.success());
     
     // Get template path
-    let template_path = config.mfs_mount.join("groups/testgroup").join(format!("{}.lasz", test_file.display()));
+    let template_path = env.mfs_mount.join("groups/testgroup").join(format!("{}.lasz", test_file.display()));
     
     // Simulate template change (as if from another machine)
     sleep(Duration::from_millis(100)).await;
@@ -77,69 +75,65 @@ async fn test_watch_with_handlebars_variables() {
     let test_file = env.test_dir.join("config.txt");
     fs::write(&test_file, "hostname: {{ hostname }}").unwrap();
     
-    let mut enrollment_manager = EnrollmentManager::new(config.clone());
-    enrollment_manager.enroll_file("testgroup", &test_file, false, false, None, None, Default::default()).await.unwrap();
+    // Enroll using CLI
+    let output = env.run_laszoo(&["enroll", "testgroup", test_file.to_str().unwrap()]).unwrap();
+    assert!(output.status.success());
     
     // Get template path
-    let template_path = config.mfs_mount.join("groups/testgroup").join(format!("{}.lasz", test_file.display()));
+    let template_path = env.mfs_mount.join("groups/testgroup").join(format!("{}.lasz", test_file.display()));
     
     // Template should preserve the variable
     let template_content = fs::read_to_string(&template_path).unwrap();
     assert!(template_content.contains("{{ hostname }}"));
     
-    // When applied, it should be rendered
-    let template_engine = TemplateEngine::new();
-    let rendered = template_engine.render(&template_content, &config.mfs_mount, None).unwrap();
-    assert!(!rendered.contains("{{ hostname }}"));
-    assert!(rendered.contains("hostname: "));
+    // Apply the template using CLI to see it rendered
+    let output = env.run_laszoo(&["apply", "testgroup"]).unwrap();
+    assert!(output.status.success());
+    
+    // Check the rendered file
+    let rendered_content = fs::read_to_string(&test_file).unwrap();
+    assert!(!rendered_content.contains("{{ hostname }}"));
+    assert!(rendered_content.contains("hostname: "));
 }
 
 #[tokio::test]
 async fn test_watch_with_quack_tags() {
     let env = TestEnvironment::new("watch_quack");
-    let config = env.create_config();
+    env.setup_git().expect("Failed to setup git");
     let hostname = gethostname::gethostname().to_string_lossy().to_string();
     
-    // Create group template with quack placeholder
+    // Create a file first
     let test_file = env.test_dir.join("config.txt");
-    let group_dir = config.mfs_mount.join("groups/testgroup");
-    fs::create_dir_all(&group_dir).unwrap();
+    fs::write(&test_file, "server: localhost\nport: 8080").unwrap();
     
-    let group_template = group_dir.join(format!("{}.lasz", test_file.display()));
+    // Enroll as hybrid
+    let output = env.run_laszoo(&["enroll", "testgroup", test_file.to_str().unwrap(), "--hybrid"]).unwrap();
+    assert!(output.status.success());
+    
+    // Modify group template to use quack placeholder
+    let group_template = env.mfs_mount.join("groups/testgroup").join(format!("{}.lasz", test_file.display()));
     fs::write(&group_template, "server: {{ quack }}\nport: 8080").unwrap();
     
     // Create machine template with quack content
-    let machine_dir = config.mfs_mount.join(format!("machines/{}", hostname));
+    let machine_dir = env.mfs_mount.join(format!("machines/{}", hostname));
     fs::create_dir_all(&machine_dir).unwrap();
     
     let machine_template = machine_dir.join(format!("{}.lasz", test_file.display()));
     fs::write(&machine_template, "[[x prod-server-01 x]]").unwrap();
     
-    // Create manifest for hybrid mode
-    let manifest = r#"{
-        "entries": [{
-            "path": "/config.txt",
-            "type": "file",
-            "hybrid": true
-        }]
-    }"#;
-    fs::write(group_dir.join("manifest.json"), manifest).unwrap();
+    // Apply template to see it rendered
+    let output = env.run_laszoo(&["apply", "testgroup"]).unwrap();
+    assert!(output.status.success());
     
-    // Render template
-    let template_engine = TemplateEngine::new();
-    let rendered = template_engine.render(
-        &fs::read_to_string(&group_template).unwrap(),
-        &config.mfs_mount,
-        Some(&PathBuf::from("/config.txt"))
-    ).unwrap();
-    
-    assert_eq!(rendered, "server: prod-server-01\nport: 8080");
+    // Check the rendered file
+    let rendered_content = fs::read_to_string(&test_file).unwrap();
+    assert_eq!(rendered_content, "server: prod-server-01\nport: 8080");
 }
 
 #[tokio::test]
 async fn test_watch_directory_enrollment() {
     let env = TestEnvironment::new("watch_directory");
-    let config = env.create_config();
+    env.setup_git().expect("Failed to setup git");
     
     // Create a directory with files
     let test_dir = env.test_dir.join("configs");
@@ -147,12 +141,12 @@ async fn test_watch_directory_enrollment() {
     fs::write(test_dir.join("app.conf"), "app config").unwrap();
     fs::write(test_dir.join("db.conf"), "db config").unwrap();
     
-    // Enroll the directory
-    let mut enrollment_manager = EnrollmentManager::new(config.clone());
-    enrollment_manager.enroll_directory("testgroup", &test_dir, false, false, None, None, Default::default()).await.unwrap();
+    // Enroll the directory using CLI
+    let output = env.run_laszoo(&["enroll", "testgroup", test_dir.to_str().unwrap()]).unwrap();
+    assert!(output.status.success());
     
     // Verify templates were created for both files
-    let group_dir = config.mfs_mount.join("groups/testgroup");
+    let group_dir = env.mfs_mount.join("groups/testgroup");
     let app_template = group_dir.join(format!("{}/app.conf.lasz", test_dir.display()));
     let db_template = group_dir.join(format!("{}/db.conf.lasz", test_dir.display()));
     

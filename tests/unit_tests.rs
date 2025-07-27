@@ -1,10 +1,10 @@
-use laszoo::config::Config;
-use laszoo::enrollment::{EnrollmentManager, EnrollmentManifest};
+use laszoo::config::{Config, LoggingConfig};
+use laszoo::enrollment::{EnrollmentManifest, EnrollmentEntry};
 use laszoo::template::TemplateEngine;
-use laszoo::sync::{SyncEngine, SyncOperationType};
-use laszoo::package::{PackageManager, PackageOperation};
+use laszoo::package::PackageOperation;
 use std::fs;
 use std::path::PathBuf;
+use chrono;
 
 mod common;
 use common::TestEnvironment;
@@ -13,11 +13,16 @@ use common::TestEnvironment;
 fn test_config_creation() {
     let config = Config {
         mfs_mount: PathBuf::from("/mnt/laszoo"),
+        default_sync_strategy: "converge".to_string(),
+        auto_commit: true,
         ollama_endpoint: "http://localhost:11434".to_string(),
         ollama_model: "llama2".to_string(),
-        log_level: "info".to_string(),
-        log_format: "pretty".to_string(),
-        auto_commit: true,
+        monitoring: Default::default(),
+        logging: LoggingConfig {
+            level: "info".to_string(),
+            format: "pretty".to_string(),
+            file: None,
+        },
     };
     
     assert_eq!(config.mfs_mount, PathBuf::from("/mnt/laszoo"));
@@ -28,7 +33,18 @@ fn test_config_creation() {
 #[test]
 fn test_enrollment_manifest_serialization() {
     let mut manifest = EnrollmentManifest::new();
-    manifest.add_entry("/etc/test.conf".into(), laszoo::enrollment::FileType::File, false, false, None, None, Default::default());
+    // Create an EnrollmentEntry directly
+    let entry = EnrollmentEntry {
+        original_path: PathBuf::from("/etc/test.conf"),
+        checksum: "abc123".to_string(),
+        group: "testgroup".to_string(),
+        enrolled_at: chrono::Utc::now(),
+        last_synced: None,
+        template_path: Some(PathBuf::from("/mnt/laszoo/groups/testgroup/etc/test.conf.lasz")),
+        is_hybrid: Some(false),
+        enrolled_directory: None,
+    };
+    manifest.entries.insert(PathBuf::from("/etc/test.conf"), entry);
     
     let json = serde_json::to_string(&manifest).unwrap();
     let deserialized: EnrollmentManifest = serde_json::from_str(&json).unwrap();
@@ -38,42 +54,32 @@ fn test_enrollment_manifest_serialization() {
 
 #[test]
 fn test_template_engine_handlebars() {
-    let engine = TemplateEngine::new();
-    let template = "Hello, {{ name }}!";
-    let rendered = engine.render(template, &PathBuf::from("/mnt/laszoo"), None).unwrap();
+    let engine = TemplateEngine::new().unwrap();
+    let template = "Hello, {{ hostname }}!";
+    let mut variables = std::collections::HashMap::new();
+    variables.insert("hostname".to_string(), serde_json::Value::String("testhost".to_string()));
+    
+    let rendered = engine.process_template(template, &variables, false).unwrap();
     
     // Should render with hostname
-    assert!(rendered.contains("Hello, "));
-    assert!(!rendered.contains("{{ name }}"));
+    assert_eq!(rendered, "Hello, testhost!");
+    assert!(!rendered.contains("{{ hostname }}"));
 }
 
 #[test]
 fn test_template_engine_quack_tags() {
     let content = "Server: [[x prod-01 x]]\nPort: 8080";
-    let engine = TemplateEngine::new();
+    let engine = TemplateEngine::new().unwrap();
     let extracted = engine.extract_quack_tags(content);
     
     assert_eq!(extracted.len(), 1);
-    assert_eq!(extracted[0], "prod-01");
+    assert_eq!(extracted[0].content, "prod-01");
 }
 
 #[test]
-fn test_sync_operation_types() {
-    let op = SyncOperationType::Rollback {
-        template_content: "template content".to_string(),
-    };
-    
-    match op {
-        SyncOperationType::Rollback { template_content } => {
-            assert_eq!(template_content, "template content");
-        }
-        _ => panic!("Wrong operation type"),
-    }
-}
-
-#[test]
-fn test_package_operation_parsing() {
-    let op = PackageOperation::from_line("+nginx").unwrap();
+fn test_package_operation_creation() {
+    // Test Install variant
+    let op = PackageOperation::Install { name: "nginx".to_string() };
     match op {
         PackageOperation::Install { name } => {
             assert_eq!(name, "nginx");
@@ -81,7 +87,8 @@ fn test_package_operation_parsing() {
         _ => panic!("Wrong operation type"),
     }
     
-    let op = PackageOperation::from_line("^docker").unwrap();
+    // Test Upgrade variant
+    let op = PackageOperation::Upgrade { name: "docker".to_string(), post_action: None };
     match op {
         PackageOperation::Upgrade { name, post_action } => {
             assert_eq!(name, "docker");
@@ -90,7 +97,8 @@ fn test_package_operation_parsing() {
         _ => panic!("Wrong operation type"),
     }
     
-    let op = PackageOperation::from_line("!unwanted-package").unwrap();
+    // Test Remove variant
+    let op = PackageOperation::Remove { name: "unwanted-package".to_string() };
     match op {
         PackageOperation::Remove { name } => {
             assert_eq!(name, "unwanted-package");

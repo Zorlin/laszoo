@@ -6,7 +6,10 @@
       "Bash(rustup target:*)",
       "Bash(ls:*)",
       "Bash(ldd:*)",
-      "Bash(chmod:*)"
+      "Bash(chmod:*)",
+      "Bash(find:*)",
+      "Bash(cargo test:*)",
+      "Bash(grep:*)"
     ],
     "deny": []
   },

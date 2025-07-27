@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use std::process::Command;
 use uuid::Uuid;
+use laszoo::config::{Config, LoggingConfig};
 
 pub struct TestEnvironment {
     pub test_dir: PathBuf,
@@ -127,6 +128,57 @@ impl TestEnvironment {
         cmd.args(args);
         
         Ok(cmd.output()?)
+    }
+    
+    pub fn create_config(&self) -> Config {
+        Config {
+            mfs_mount: self.mfs_mount.clone(),
+            default_sync_strategy: "converge".to_string(),
+            auto_commit: true,
+            ollama_endpoint: "http://localhost:11434".to_string(),
+            ollama_model: "llama2".to_string(),
+            monitoring: Default::default(),
+            logging: LoggingConfig {
+                level: "info".to_string(),
+                format: "pretty".to_string(),
+                file: None,
+            },
+        }
+    }
+    
+    pub fn get_binary_path(&self) -> PathBuf {
+        // Find the binary - when running tests, cargo sets CARGO_BIN_EXE_<name>
+        if let Ok(path) = std::env::var("CARGO_BIN_EXE_laszoo") {
+            PathBuf::from(path)
+        } else {
+            // Get the project root (where Cargo.toml is)
+            let mut current_dir = std::env::current_dir().expect("Failed to get current dir");
+            let mut project_root = None;
+            
+            // Search upward for Cargo.toml
+            loop {
+                if current_dir.join("Cargo.toml").exists() {
+                    project_root = Some(current_dir);
+                    break;
+                }
+                
+                if !current_dir.pop() {
+                    break;
+                }
+            }
+            
+            let root = project_root.expect("Could not find project root");
+            
+            // Check possible paths relative to project root
+            let possible_paths = [
+                root.join("target/release/laszoo"),
+                root.join("target/debug/laszoo"),
+            ];
+            
+            possible_paths.into_iter()
+                .find(|p| p.exists())
+                .expect("Could not find laszoo binary")
+        }
     }
     
     pub fn cleanup(&self) {

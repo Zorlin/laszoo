@@ -1,8 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
-use tokio::time::sleep;
 
 mod common;
 use common::TestEnvironment;
@@ -254,28 +252,4 @@ async fn test_e2e_group_management() {
         .expect("Failed to remove from group");
     
     assert!(output.status.success());
-}
-
-mod common {
-    use super::*;
-    
-    impl TestEnvironment {
-        pub fn get_binary_path(&self) -> PathBuf {
-            // Assume we're running from project root
-            let mut path = std::env::current_dir().unwrap();
-            path.push("target/release/laszoo");
-            
-            if !path.exists() {
-                path.pop();
-                path.pop();
-                path.push("debug/laszoo");
-            }
-            
-            if !path.exists() {
-                panic!("Laszoo binary not found. Run 'cargo build --release' first.");
-            }
-            
-            path
-        }
-    }
 }

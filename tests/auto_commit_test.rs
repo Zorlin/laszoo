@@ -1,6 +1,3 @@
-use laszoo::config::Config;
-use laszoo::enrollment::EnrollmentManager;
-use laszoo::git::GitManager;
 use std::fs;
 use std::process::Command;
 
@@ -11,26 +8,20 @@ use common::TestEnvironment;
 #[ignore = "auto-commit on enrollment not yet implemented"]
 async fn test_auto_commit_on_enrollment() {
     let env = TestEnvironment::new("auto_commit_enroll");
-    let config = env.create_config();
-    
-    // Initialize git repo
-    Command::new("git")
-        .args(&["init"])
-        .current_dir(&config.mfs_mount)
-        .output()
-        .expect("Failed to init git");
+    env.setup_git().expect("Failed to setup git");
     
     // Create and enroll a file
     let test_file = env.test_dir.join("config.txt");
     fs::write(&test_file, "test content").unwrap();
     
-    let mut enrollment_manager = EnrollmentManager::new(config.clone());
-    enrollment_manager.enroll_file("testgroup", &test_file, false, false, None, None, Default::default()).await.unwrap();
+    // Enroll using CLI
+    let output = env.run_laszoo(&["enroll", "testgroup", test_file.to_str().unwrap()]).unwrap();
+    assert!(output.status.success());
     
     // TODO: Check that a commit was made
     let output = Command::new("git")
         .args(&["log", "--oneline"])
-        .current_dir(&config.mfs_mount)
+        .current_dir(&env.mfs_mount)
         .output()
         .expect("Failed to get git log");
     
@@ -43,14 +34,7 @@ async fn test_auto_commit_on_enrollment() {
 #[ignore = "auto-commit on enrollment not yet implemented"]
 async fn test_auto_commit_with_ollama() {
     let env = TestEnvironment::new("auto_commit_ollama");
-    let config = env.create_config();
-    
-    // Initialize git repo
-    Command::new("git")
-        .args(&["init"])
-        .current_dir(&config.mfs_mount)
-        .output()
-        .expect("Failed to init git");
+    env.setup_git().expect("Failed to setup git");
     
     // TODO: Mock or check if Ollama is available
     // If available, commit message should be AI-generated
@@ -61,14 +45,7 @@ async fn test_auto_commit_with_ollama() {
 #[ignore = "auto-commit on enrollment not yet implemented"]
 async fn test_auto_commit_batch_enrollment() {
     let env = TestEnvironment::new("auto_commit_batch");
-    let config = env.create_config();
-    
-    // Initialize git repo
-    Command::new("git")
-        .args(&["init"])
-        .current_dir(&config.mfs_mount)
-        .output()
-        .expect("Failed to init git");
+    env.setup_git().expect("Failed to setup git");
     
     // Create multiple files
     let file1 = env.test_dir.join("file1.txt");
@@ -78,11 +55,13 @@ async fn test_auto_commit_batch_enrollment() {
     fs::write(&file2, "content2").unwrap();
     fs::write(&file3, "content3").unwrap();
     
-    // Enroll all files at once
-    let mut enrollment_manager = EnrollmentManager::new(config.clone());
-    enrollment_manager.enroll_file("testgroup", &file1, false, false, None, None, Default::default()).await.unwrap();
-    enrollment_manager.enroll_file("testgroup", &file2, false, false, None, None, Default::default()).await.unwrap();
-    enrollment_manager.enroll_file("testgroup", &file3, false, false, None, None, Default::default()).await.unwrap();
+    // Enroll all files at once using CLI
+    let output = env.run_laszoo(&["enroll", "testgroup", file1.to_str().unwrap()]).unwrap();
+    assert!(output.status.success());
+    let output = env.run_laszoo(&["enroll", "testgroup", file2.to_str().unwrap()]).unwrap();
+    assert!(output.status.success());
+    let output = env.run_laszoo(&["enroll", "testgroup", file3.to_str().unwrap()]).unwrap();
+    assert!(output.status.success());
     
     // TODO: Should create a single commit for all enrollments
     // or intelligently batch them
@@ -92,14 +71,7 @@ async fn test_auto_commit_batch_enrollment() {
 #[ignore = "auto-commit on enrollment not yet implemented"]
 async fn test_auto_commit_directory_enrollment() {
     let env = TestEnvironment::new("auto_commit_dir");
-    let config = env.create_config();
-    
-    // Initialize git repo
-    Command::new("git")
-        .args(&["init"])
-        .current_dir(&config.mfs_mount)
-        .output()
-        .expect("Failed to init git");
+    env.setup_git().expect("Failed to setup git");
     
     // Create a directory with files
     let test_dir = env.test_dir.join("configs");
@@ -107,14 +79,14 @@ async fn test_auto_commit_directory_enrollment() {
     fs::write(test_dir.join("app.conf"), "app config").unwrap();
     fs::write(test_dir.join("db.conf"), "db config").unwrap();
     
-    // Enroll the directory
-    let mut enrollment_manager = EnrollmentManager::new(config.clone());
-    enrollment_manager.enroll_directory("testgroup", &test_dir, false, false, None, None, Default::default()).await.unwrap();
+    // Enroll the directory using CLI
+    let output = env.run_laszoo(&["enroll", "testgroup", test_dir.to_str().unwrap()]).unwrap();
+    assert!(output.status.success());
     
     // TODO: Should create a commit for the directory enrollment
     let output = Command::new("git")
         .args(&["log", "--oneline"])
-        .current_dir(&config.mfs_mount)
+        .current_dir(&env.mfs_mount)
         .output()
         .expect("Failed to get git log");
     
@@ -126,27 +98,19 @@ async fn test_auto_commit_directory_enrollment() {
 #[ignore = "auto-commit on enrollment not yet implemented"]
 async fn test_no_commit_on_failed_enrollment() {
     let env = TestEnvironment::new("auto_commit_fail");
-    let config = env.create_config();
-    
-    // Initialize git repo
-    Command::new("git")
-        .args(&["init"])
-        .current_dir(&config.mfs_mount)
-        .output()
-        .expect("Failed to init git");
+    env.setup_git().expect("Failed to setup git");
     
     // Try to enroll a non-existent file
     let test_file = env.test_dir.join("nonexistent.txt");
     
-    let mut enrollment_manager = EnrollmentManager::new(config.clone());
-    let result = enrollment_manager.enroll_file("testgroup", &test_file, false, false, None, None, Default::default()).await;
-    
-    assert!(result.is_err());
+    // Try to enroll using CLI - should fail
+    let output = env.run_laszoo(&["enroll", "testgroup", test_file.to_str().unwrap()]).unwrap();
+    assert!(!output.status.success());
     
     // TODO: No commit should be made for failed enrollment
     let output = Command::new("git")
         .args(&["log", "--oneline"])
-        .current_dir(&config.mfs_mount)
+        .current_dir(&env.mfs_mount)
         .output()
         .expect("Failed to get git log");
     

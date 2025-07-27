@@ -1,7 +1,4 @@
-use laszoo::config::Config;
-use laszoo::enrollment::EnrollmentManager;
 use std::fs;
-use chrono::Utc;
 
 mod common;
 use common::TestEnvironment;
@@ -10,7 +7,7 @@ use common::TestEnvironment;
 #[ignore = "report command not yet implemented"]
 async fn test_report_compliance_status() {
     let env = TestEnvironment::new("report_compliance");
-    let config = env.create_config();
+    env.setup_git().expect("Failed to setup git");
     
     // Create and enroll files
     let file1 = env.test_dir.join("compliant.txt");
@@ -18,9 +15,11 @@ async fn test_report_compliance_status() {
     fs::write(&file1, "correct content").unwrap();
     fs::write(&file2, "original content").unwrap();
     
-    let mut enrollment_manager = EnrollmentManager::new(config.clone());
-    enrollment_manager.enroll_file("testgroup", &file1, false, false, None, None, Default::default()).await.unwrap();
-    enrollment_manager.enroll_file("testgroup", &file2, false, false, None, None, Default::default()).await.unwrap();
+    // Enroll using CLI
+    let output = env.run_laszoo(&["enroll", "testgroup", file1.to_str().unwrap()]).unwrap();
+    assert!(output.status.success());
+    let output = env.run_laszoo(&["enroll", "testgroup", file2.to_str().unwrap()]).unwrap();
+    assert!(output.status.success());
     
     // Modify one file to create drift
     fs::write(&file2, "drifted content").unwrap();
@@ -36,7 +35,7 @@ async fn test_report_compliance_status() {
 #[ignore = "report command not yet implemented"]
 async fn test_report_action_history() {
     let env = TestEnvironment::new("report_actions");
-    let config = env.create_config();
+    env.setup_git().expect("Failed to setup git");
     
     // TODO: When action logging is implemented, report should show:
     // - Timestamp of each action
@@ -50,7 +49,7 @@ async fn test_report_action_history() {
 #[ignore = "report command not yet implemented"]
 async fn test_report_group_filter() {
     let env = TestEnvironment::new("report_group_filter");
-    let config = env.create_config();
+    env.setup_git().expect("Failed to setup git");
     
     // Create files in different groups
     let file1 = env.test_dir.join("file1.txt");
@@ -58,9 +57,11 @@ async fn test_report_group_filter() {
     fs::write(&file1, "content1").unwrap();
     fs::write(&file2, "content2").unwrap();
     
-    let mut enrollment_manager = EnrollmentManager::new(config.clone());
-    enrollment_manager.enroll_file("group1", &file1, false, false, None, None, Default::default()).await.unwrap();
-    enrollment_manager.enroll_file("group2", &file2, false, false, None, None, Default::default()).await.unwrap();
+    // Enroll using CLI
+    let output = env.run_laszoo(&["enroll", "group1", file1.to_str().unwrap()]).unwrap();
+    assert!(output.status.success());
+    let output = env.run_laszoo(&["enroll", "group2", file2.to_str().unwrap()]).unwrap();
+    assert!(output.status.success());
     
     // TODO: `laszoo report group1` should only show status for group1 files
 }
@@ -69,7 +70,7 @@ async fn test_report_group_filter() {
 #[ignore = "report command not yet implemented"]
 async fn test_report_json_format() {
     let env = TestEnvironment::new("report_json");
-    let config = env.create_config();
+    env.setup_git().expect("Failed to setup git");
     
     // TODO: `laszoo report --format json` should output:
     // {
@@ -92,15 +93,15 @@ async fn test_report_json_format() {
 #[ignore = "report command not yet implemented"]
 async fn test_report_drift_details() {
     let env = TestEnvironment::new("report_drift_details");
-    let config = env.create_config();
+    env.setup_git().expect("Failed to setup git");
     
     // Create and enroll a file with drift action
     let test_file = env.test_dir.join("drift.txt");
     fs::write(&test_file, "original").unwrap();
     
-    let mut enrollment_manager = EnrollmentManager::new(config.clone());
-    enrollment_manager.enroll_file("testgroup", &test_file, false, false, None, None, 
-        laszoo::cli::SyncAction::Drift).await.unwrap();
+    // Enroll using CLI with drift action
+    let output = env.run_laszoo(&["enroll", "testgroup", "--sync", "drift", test_file.to_str().unwrap()]).unwrap();
+    assert!(output.status.success());
     
     // Modify the file
     fs::write(&test_file, "drifted").unwrap();
@@ -116,14 +117,15 @@ async fn test_report_drift_details() {
 #[ignore = "report command not yet implemented"]
 async fn test_report_missing_files() {
     let env = TestEnvironment::new("report_missing");
-    let config = env.create_config();
+    env.setup_git().expect("Failed to setup git");
     
     // Enroll a file
     let test_file = env.test_dir.join("missing.txt");
     fs::write(&test_file, "content").unwrap();
     
-    let mut enrollment_manager = EnrollmentManager::new(config.clone());
-    enrollment_manager.enroll_file("testgroup", &test_file, false, false, None, None, Default::default()).await.unwrap();
+    // Enroll using CLI
+    let output = env.run_laszoo(&["enroll", "testgroup", test_file.to_str().unwrap()]).unwrap();
+    assert!(output.status.success());
     
     // Delete the local file
     fs::remove_file(&test_file).unwrap();
