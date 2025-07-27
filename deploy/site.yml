@@ -1,0 +1,83 @@
+---
+- name: Deploy MooseFS
+  groups:
+    - laszoo
+
+  tasks:
+    # Create directory for apt keyrings
+    - !directory
+      path: /etc/apt/keyrings
+      attributes:
+        owner: root
+        group: root
+        mode: 0o755
+
+    - !shell
+      cmd: apt-get update ; sleep 0.2
+
+    # Ensure gpg is installed
+    - !apt
+      package: gnupg
+
+    # Ensure curl is installed
+    - !apt
+      package: curl
+
+    # Add gpg keyring
+    - !shell
+      cmd: curl -fsSL https://repository.moosefs.com/moosefs.key | gpg --batch --yes --dearmor -o /etc/apt/keyrings/moosefs.gpg
+
+    - !template
+      src: ./moosefs.list.hb
+      dest: /etc/apt/sources.list.d/moosefs.list
+      attributes:
+        owner: root
+        group: root
+        mode: 0o644
+
+    - !shell
+      cmd: apt update ; sleep 2
+
+    - !apt
+      package: moosefs-pro-client
+
+    - !apt
+      package: fuse3
+
+- name: Deploy Laszoo mountpoint
+  groups:
+    - laszoo
+
+  tasks:
+    - !file
+      path: /etc/systemd/system/laszoo.mount
+      remove: true
+
+    - !template
+      src: ./mnt-laszoo.mount.hb
+      dest: /etc/systemd/system/mnt-laszoo.mount
+      attributes:
+        owner: root
+        group: root
+        mode: 0o644
+
+    - !sd_service
+      service: mnt-laszoo.mount
+      started: true
+      enabled: true
+
+- name: Deploy Laszoo
+  groups:
+    - laszoo
+
+  tasks:
+    - !copy
+      src: "{{ laszoo_binary }}"
+      dest: /usr/local/bin/laszoo
+      attributes:
+        owner: root
+        group: root
+        mode: 0o755
+
+    - !shell
+      cmd: /usr/local/bin/laszoo service install
