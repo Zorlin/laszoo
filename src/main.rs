@@ -2000,6 +2000,7 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
 
     // Track packages.conf files
     let mut packages_conf_checksums: HashMap<PathBuf, String> = HashMap::new();
+    let mut packages_conf_timestamps: HashMap<PathBuf, std::time::SystemTime> = HashMap::new();
     let mut last_packages_scan = std::time::Instant::now();
     let packages_scan_interval = Duration::from_millis(500); // Check every 500ms
 
@@ -2011,7 +2012,13 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
         let packages_conf_path = group_dir.join("etc").join("laszoo").join("packages.conf");
         if packages_conf_path.exists() {
             if let Ok(checksum) = calculate_file_checksum(&packages_conf_path) {
-                packages_conf_checksums.insert(packages_conf_path, checksum);
+                packages_conf_checksums.insert(packages_conf_path.clone(), checksum);
+            }
+            // Record initial timestamp
+            if let Ok(metadata) = std::fs::metadata(&packages_conf_path) {
+                if let Ok(modified) = metadata.modified() {
+                    packages_conf_timestamps.insert(packages_conf_path, modified);
+                }
             }
         }
         
@@ -2046,7 +2053,13 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
         .join("packages.conf");
     if machine_packages_conf.exists() {
         if let Ok(checksum) = calculate_file_checksum(&machine_packages_conf) {
-            packages_conf_checksums.insert(machine_packages_conf, checksum);
+            packages_conf_checksums.insert(machine_packages_conf.clone(), checksum);
+        }
+        // Record initial timestamp
+        if let Ok(metadata) = std::fs::metadata(&machine_packages_conf) {
+            if let Ok(modified) = metadata.modified() {
+                packages_conf_timestamps.insert(machine_packages_conf, modified);
+            }
         }
     }
 
@@ -2567,15 +2580,38 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
                         let packages_conf_path = group_dir.join("etc").join("laszoo").join("packages.conf");
                         
                         if packages_conf_path.exists() {
-                            if let Ok(current_checksum) = calculate_file_checksum(&packages_conf_path) {
-                                if let Some(known_checksum) = packages_conf_checksums.get(&packages_conf_path) {
-                                    if &current_checksum != known_checksum {
-                                        println!("\n[{}] Packages configuration changed for group '{}'",
-                                            chrono::Local::now().format("%H:%M:%S"),
-                                            group_name
-                                        );
-                                        packages_conf_checksums.insert(packages_conf_path.clone(), current_checksum);
-                                        packages_changed = true;
+                            // Check timestamp first (faster)
+                            let mut should_check_hash = false;
+                            if let Ok(metadata) = std::fs::metadata(&packages_conf_path) {
+                                if let Ok(current_modified) = metadata.modified() {
+                                    if let Some(known_modified) = packages_conf_timestamps.get(&packages_conf_path) {
+                                        if current_modified != *known_modified {
+                                            should_check_hash = true;
+                                        }
+                                    } else {
+                                        // New file
+                                        should_check_hash = true;
+                                    }
+                                }
+                            }
+                            
+                            // Only calculate checksum if timestamp changed
+                            if should_check_hash {
+                                if let Ok(current_checksum) = calculate_file_checksum(&packages_conf_path) {
+                                    if let Some(known_checksum) = packages_conf_checksums.get(&packages_conf_path) {
+                                        if &current_checksum != known_checksum {
+                                            println!("\n[{}] Packages configuration changed for group '{}'",
+                                                chrono::Local::now().format("%H:%M:%S"),
+                                                group_name
+                                            );
+                                            packages_conf_checksums.insert(packages_conf_path.clone(), current_checksum);
+                                            // Update timestamp too
+                                            if let Ok(metadata) = std::fs::metadata(&packages_conf_path) {
+                                                if let Ok(modified) = metadata.modified() {
+                                                    packages_conf_timestamps.insert(packages_conf_path.clone(), modified);
+                                                }
+                                            }
+                                            packages_changed = true;
                                         
                                         // Apply package changes if auto mode is enabled
                                         if auto {
@@ -2625,6 +2661,12 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
                                 } else {
                                     // New packages.conf file
                                     packages_conf_checksums.insert(packages_conf_path.clone(), current_checksum);
+                                    // Record timestamp for new file
+                                    if let Ok(metadata) = std::fs::metadata(&packages_conf_path) {
+                                        if let Ok(modified) = metadata.modified() {
+                                            packages_conf_timestamps.insert(packages_conf_path.clone(), modified);
+                                        }
+                                    }
                                     println!("\n[{}] New packages configuration detected for group '{}'",
                                         chrono::Local::now().format("%H:%M:%S"),
                                         group_name
@@ -2634,6 +2676,7 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
                             }
                         }
                     }
+                }
                     
                     // Check machine-specific packages.conf
                     let machine_packages_conf = config.mfs_mount
@@ -2644,14 +2687,37 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
                         .join("packages.conf");
                         
                     if machine_packages_conf.exists() {
-                        if let Ok(current_checksum) = calculate_file_checksum(&machine_packages_conf) {
-                            if let Some(known_checksum) = packages_conf_checksums.get(&machine_packages_conf) {
-                                if &current_checksum != known_checksum {
-                                    println!("\n[{}] Machine-specific packages configuration changed",
-                                        chrono::Local::now().format("%H:%M:%S")
-                                    );
-                                    packages_conf_checksums.insert(machine_packages_conf.clone(), current_checksum);
-                                    packages_changed = true;
+                        // Check timestamp first (faster)
+                        let mut should_check_hash = false;
+                        if let Ok(metadata) = std::fs::metadata(&machine_packages_conf) {
+                            if let Ok(current_modified) = metadata.modified() {
+                                if let Some(known_modified) = packages_conf_timestamps.get(&machine_packages_conf) {
+                                    if current_modified != *known_modified {
+                                        should_check_hash = true;
+                                    }
+                                } else {
+                                    // New file
+                                    should_check_hash = true;
+                                }
+                            }
+                        }
+                        
+                        // Only calculate checksum if timestamp changed
+                        if should_check_hash {
+                            if let Ok(current_checksum) = calculate_file_checksum(&machine_packages_conf) {
+                                if let Some(known_checksum) = packages_conf_checksums.get(&machine_packages_conf) {
+                                    if &current_checksum != known_checksum {
+                                        println!("\n[{}] Machine-specific packages configuration changed",
+                                            chrono::Local::now().format("%H:%M:%S")
+                                        );
+                                        packages_conf_checksums.insert(machine_packages_conf.clone(), current_checksum);
+                                        // Update timestamp too
+                                        if let Ok(metadata) = std::fs::metadata(&machine_packages_conf) {
+                                            if let Ok(modified) = metadata.modified() {
+                                                packages_conf_timestamps.insert(machine_packages_conf.clone(), modified);
+                                            }
+                                        }
+                                        packages_changed = true;
                                     
                                     // Apply package changes if auto mode is enabled
                                     if auto {
@@ -2669,9 +2735,16 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
                             } else {
                                 // New packages.conf file
                                 packages_conf_checksums.insert(machine_packages_conf.clone(), current_checksum);
+                                // Record timestamp for new file
+                                if let Ok(metadata) = std::fs::metadata(&machine_packages_conf) {
+                                    if let Ok(modified) = metadata.modified() {
+                                        packages_conf_timestamps.insert(machine_packages_conf.clone(), modified);
+                                    }
+                                }
                             }
                         }
                     }
+                }
                     
                     if packages_changed {
                         println!(); // Add blank line for readability
@@ -2916,16 +2989,25 @@ fn update_manifest_config(
 fn is_laszoo_watch_running() -> bool {
     use std::process::Command;
     
-    // Check if the laszoo service is running
-    let output = Command::new("systemctl")
+    // First check if the laszoo service is running
+    let service_output = Command::new("systemctl")
         .args(&["is-active", "laszoo"])
         .output();
     
-    match output {
-        Ok(output) => {
-            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            status == "active"
+    if let Ok(output) = service_output {
+        let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if status == "active" {
+            return true;
         }
+    }
+    
+    // Also check for running laszoo watch processes
+    let ps_output = Command::new("pgrep")
+        .args(&["-f", "laszoo watch"])
+        .output();
+    
+    match ps_output {
+        Ok(output) => !output.stdout.is_empty(),
         Err(_) => false,
     }
 }

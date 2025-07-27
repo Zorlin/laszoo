@@ -698,8 +698,9 @@ impl PackageManager {
         
         let output = match pkg_mgr {
             PackageManagerType::Apt => {
-                Command::new("dpkg")
-                    .args(&["-l", package])
+                // Use dpkg-query for more reliable checking
+                Command::new("dpkg-query")
+                    .args(&["-W", "-f=${Status}", package])
                     .output()
                     .await?
             }
@@ -729,7 +730,66 @@ impl PackageManager {
             }
         };
         
-        Ok(output.status.success())
+        match pkg_mgr {
+            PackageManagerType::Apt => {
+                if !output.status.success() {
+                    return Ok(false);
+                }
+                let status = String::from_utf8_lossy(&output.stdout);
+                // Package is installed if status contains "install ok installed"
+                Ok(status.contains("install ok installed"))
+            }
+            _ => Ok(output.status.success())
+        }
+    }
+
+    /// Get installation status for multiple packages in a single batch call
+    async fn get_package_states_batch(&self, pkg_mgr: &PackageManagerType, packages: &[String]) -> Result<std::collections::HashMap<String, bool>> {
+        use tokio::process::Command;
+        
+        let mut states = std::collections::HashMap::new();
+        
+        match pkg_mgr {
+            PackageManagerType::Apt => {
+                // Use dpkg-query to check all packages in one call
+                let mut cmd = Command::new("dpkg-query");
+                cmd.args(&["-W", "-f=${Package} ${Status}\n"]);
+                for package in packages {
+                    cmd.arg(package);
+                }
+                
+                let output = cmd.output().await?;
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                
+                for line in stdout.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 4 {
+                        let package_name = parts[0];
+                        let is_installed = parts.len() >= 4 && 
+                            parts[1] == "install" && 
+                            parts[2] == "ok" && 
+                            parts[3] == "installed";
+                        states.insert(package_name.to_string(), is_installed);
+                    }
+                }
+                
+                // For packages not returned by dpkg-query, they're not installed
+                for package in packages {
+                    if !states.contains_key(package) {
+                        states.insert(package.clone(), false);
+                    }
+                }
+            }
+            _ => {
+                // Fall back to individual checks for other package managers
+                for package in packages {
+                    let installed = self.is_package_installed(pkg_mgr, package).await?;
+                    states.insert(package.clone(), installed);
+                }
+            }
+        }
+        
+        Ok(states)
     }
 
     /// Apply package operations on the local system with group context
@@ -739,34 +799,87 @@ impl PackageManager {
             .to_string_lossy()
             .to_string();
         
-        // Get current state of all packages mentioned in operations
-        let mut package_states = std::collections::HashMap::new();
+        println!("DEBUG: Processing {} operations", operations.len());
+        for (i, op) in operations.iter().enumerate() {
+            println!("DEBUG: Operation {}: {:?}", i, op);
+        }
+        
+        // Collect all package names that need state checking
+        let mut package_names = Vec::new();
         for op in operations {
             match op {
                 PackageOperation::Install { name } |
                 PackageOperation::Remove { name } |
                 PackageOperation::Purge { name } |
                 PackageOperation::Upgrade { name, .. } => {
-                    debug!("Checking if package '{}' is installed", name);
-                    let installed = self.is_package_installed(&pkg_mgr, &name).await?;
-                    debug!("Package '{}' installed: {}", name, installed);
-                    package_states.insert(name.clone(), installed);
+                    if !package_names.contains(name) {
+                        package_names.push(name.clone());
+                    }
                 }
                 _ => {} // System operations don't need state check
             }
         }
         
+        // Get current state of all packages in a single batch call
+        println!("DEBUG: Checking status of {} packages in batch: {:?}", package_names.len(), package_names);
+        let package_states = self.get_package_states_batch(&pkg_mgr, &package_names).await?;
+        for (name, installed) in &package_states {
+            println!("DEBUG: Package '{}' installed: {}", name, installed);
+        }
+        
+        // Collect all packages that need to be installed in batch
+        let mut packages_to_install = Vec::new();
         for op in operations {
-            match op {
-                PackageOperation::Install { name } => {
-                    if let Some(&installed) = package_states.get(name) {
-                        if !installed {
-                            info!("Installing package: {}", name);
-                            self.install_package(&pkg_mgr, name).await?;
-                        } else {
-                            debug!("Package {} already installed, skipping", name);
+            if let PackageOperation::Install { name } = op {
+                if let Some(&installed) = package_states.get(name) {
+                    if !installed {
+                        println!("DEBUG: Package '{}' not installed, adding to batch", name);
+                        packages_to_install.push(name.clone());
+                    } else {
+                        println!("DEBUG: Package '{}' already installed, skipping", name);
+                    }
+                } else {
+                    println!("DEBUG: No state information for package '{}'", name);
+                }
+            }
+        }
+        
+        // Install all missing packages in a single batch command
+        if !packages_to_install.is_empty() {
+            println!("DEBUG: About to install {} packages in batch: {}", packages_to_install.len(), packages_to_install.join(" "));
+            info!("Installing packages in batch: {}", packages_to_install.join(" "));
+            match self.install_packages_batch(&pkg_mgr, &packages_to_install).await {
+                Ok(()) => {
+                    println!("DEBUG: Batch install completed successfully");
+                }
+                Err(e) => {
+                    println!("DEBUG: Batch install failed: {}", e);
+                    // Try to install packages individually to identify which one failed
+                    warn!("Batch install failed, attempting individual package installation");
+                    for package in &packages_to_install {
+                        match self.install_package(&pkg_mgr, package).await {
+                            Ok(()) => {
+                                info!("Successfully installed package: {}", package);
+                            }
+                            Err(individual_err) => {
+                                error!("Failed to install package '{}': {}", package, individual_err);
+                                // Record the failure for this specific package
+                                self.record_package_failure(group, package, "install", &individual_err.to_string()).await;
+                            }
                         }
                     }
+                }
+            }
+        } else {
+            println!("DEBUG: No packages to install in batch");
+        }
+        
+        // Process remaining operations individually
+        for op in operations {
+            match op {
+                PackageOperation::Install { .. } => {
+                    // Already handled in batch above
+                    continue;
                 }
                 PackageOperation::Upgrade { name, post_action } => {
                     info!("Upgrading package: {}", name);
@@ -825,6 +938,17 @@ impl PackageManager {
                     // Check if there are actually updates available
                     if !self.has_system_updates(&pkg_mgr).await? {
                         info!("No system updates available, skipping ++upgrade");
+                        // Record as completed even when skipped
+                        let action_record = ActionRecord {
+                            timestamp: Utc::now(),
+                            hostname: hostname.clone(),
+                            action_type: "package_upgrade_all".to_string(),
+                            target: "++upgrade".to_string(),
+                            group: group.map(|s| s.to_string()),
+                            status: "completed".to_string(),
+                            details: Some("No updates available".to_string()),
+                        };
+                        let _ = self.record_action(&action_record);
                         continue;
                     }
                     
@@ -885,6 +1009,17 @@ impl PackageManager {
                     // Check if there are actually updates available
                     if !self.has_system_updates(&pkg_mgr).await? {
                         info!("No system updates available, skipping ++dist-upgrade");
+                        // Record as completed even when skipped
+                        let action_record = ActionRecord {
+                            timestamp: Utc::now(),
+                            hostname: hostname.clone(),
+                            action_type: "package_dist_upgrade_all".to_string(),
+                            target: "++dist-upgrade".to_string(),
+                            group: group.map(|s| s.to_string()),
+                            status: "completed".to_string(),
+                            details: Some("No updates available".to_string()),
+                        };
+                        let _ = self.record_action(&action_record);
                         continue;
                     }
                     
@@ -1016,7 +1151,16 @@ impl PackageManager {
                     if let Some(&installed) = package_states.get(name) {
                         if installed {
                             info!("Removing package: {}", name);
-                            self.remove_package(&pkg_mgr, name).await?;
+                            match self.remove_package(&pkg_mgr, name).await {
+                                Ok(()) => {
+                                    info!("Successfully removed package: {}", name);
+                                }
+                                Err(e) => {
+                                    error!("Failed to remove package '{}': {}", name, e);
+                                    self.record_package_failure(group, name, "remove", &e.to_string()).await;
+                                    // Continue with other operations instead of failing completely
+                                }
+                            }
                         } else {
                             debug!("Package {} not installed, skipping removal", name);
                         }
@@ -1065,6 +1209,33 @@ impl PackageManager {
         self.run_command(&cmd).await
     }
 
+    /// Install multiple packages in a single batch command
+    async fn install_packages_batch(&self, pkg_mgr: &PackageManagerType, packages: &[String]) -> Result<()> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+        
+        println!("DEBUG: install_packages_batch called with {} packages: {:?}", packages.len(), packages);
+        
+        // Wait for package manager to be available
+        self.wait_for_package_manager(pkg_mgr).await?;
+        
+        let packages_str = packages.join(" ");
+        let cmd = match pkg_mgr {
+            PackageManagerType::Apt => format!("apt-get install -y {}", packages_str),
+            PackageManagerType::Yum => format!("yum install -y {}", packages_str),
+            PackageManagerType::Dnf => format!("dnf install -y {}", packages_str),
+            PackageManagerType::Pacman => format!("pacman -S --noconfirm {}", packages_str),
+            PackageManagerType::Zypper => format!("zypper install -y {}", packages_str),
+            PackageManagerType::Apk => format!("apk add {}", packages_str),
+        };
+
+        println!("DEBUG: About to run command: {}", cmd);
+        let result = self.run_command(&cmd).await;
+        println!("DEBUG: Command result: {:?}", result);
+        result
+    }
+
     /// Upgrade a package
     async fn upgrade_package(&self, pkg_mgr: &PackageManagerType, package: &str) -> Result<()> {
         // Wait for package manager to be available
@@ -1097,6 +1268,25 @@ impl PackageManager {
         };
 
         self.run_command(&cmd).await
+    }
+    
+    /// Record a package operation failure for status tracking
+    async fn record_package_failure(&self, group: Option<&str>, package: &str, operation: &str, error_msg: &str) {
+        let hostname = gethostname::gethostname().to_string_lossy().to_string();
+        
+        let failure_record = ActionRecord {
+            timestamp: chrono::Utc::now(),
+            hostname,
+            action_type: format!("package_{}_failed", operation),
+            target: package.to_string(),
+            group: group.map(|g| g.to_string()),
+            status: "failed".to_string(),
+            details: Some(error_msg.to_string()),
+        };
+        
+        if let Err(e) = self.record_action(&failure_record) {
+            error!("Failed to record package failure: {}", e);
+        }
     }
 
     /// Purge a package
