@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::fs;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use crate::config::Config;
 use crate::group::GroupManager;
 use serde_json::Value as JsonValue;
@@ -59,35 +59,22 @@ impl InventoryGenerator {
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                info!("Permission denied, escalating privileges to create directory: {:?}", path);
+                debug!("Permission denied, re-executing with sudo");
                 
-                // Escalate to root
-                let uid_before = unsafe { libc::geteuid() };
-                sudo::escalate_if_needed().map_err(|e| anyhow!("Failed to escalate privileges: {}", e))?;
+                // Get the current executable path
+                let exe_path = std::env::current_exe()?;
                 
-                // Now we're root, create the directory
-                let result = fs::create_dir_all(path);
+                // Re-execute ourselves with sudo
+                let status = std::process::Command::new("sudo")
+                    .arg(&exe_path)
+                    .arg("--privileged-mkdir")
+                    .arg(path)
+                    .status()?;
                 
-                // Set proper permissions if successful
-                if result.is_ok() {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mut perms = fs::metadata(path)?.permissions();
-                        perms.set_mode(0o755);
-                        let _ = fs::set_permissions(path, perms);
-                    }
+                if !status.success() {
+                    return Err(anyhow!("Failed to create directory with sudo"));
                 }
                 
-                // Drop privileges back to original user
-                if uid_before != 0 {
-                    unsafe {
-                        libc::seteuid(uid_before);
-                    }
-                }
-                
-                result?;
-                debug!("Created directory with elevated privileges: {:?}", path);
                 Ok(())
             }
             Err(e) => Err(e.into()),

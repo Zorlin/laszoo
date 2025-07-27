@@ -20,6 +20,7 @@ use tracing::{info, error, debug, warn};
 use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::process::CommandExt;
+use nix::unistd;
 
 #[derive(Debug, Clone, Copy)]
 enum PackageStatus {
@@ -114,6 +115,58 @@ fn reexec_with_sudo() -> ! {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Handle privileged operations when re-executed with sudo
+    // This must come BEFORE CLI parsing
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 {
+        match args[1].as_str() {
+            "--privileged-mkdir" => {
+                // Handle privileged directory creation
+                let path = PathBuf::from(&args[2]);
+                if !nix::unistd::geteuid().is_root() {
+                    eprintln!("Error: --privileged-mkdir must be run as root");
+                    std::process::exit(1);
+                }
+                
+                // Create directory
+                if let Err(e) = std::fs::create_dir_all(&path) {
+                    eprintln!("Failed to create directory: {}", e);
+                    std::process::exit(1);
+                }
+                
+                // Set permissions to 755
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(0o755);
+                    if let Err(e) = std::fs::set_permissions(&path, perms) {
+                        eprintln!("Failed to set permissions: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                
+                std::process::exit(0);
+            }
+            "--privileged-rmdir" => {
+                // Handle privileged directory removal
+                let path = PathBuf::from(&args[2]);
+                if !nix::unistd::geteuid().is_root() {
+                    eprintln!("Error: --privileged-rmdir must be run as root");
+                    std::process::exit(1);
+                }
+                
+                // Remove directory
+                if let Err(e) = std::fs::remove_dir_all(&path) {
+                    eprintln!("Failed to remove directory: {}", e);
+                    std::process::exit(1);
+                }
+                
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+    }
+    
     // Parse CLI arguments
     let cli = Cli::parse();
 
@@ -3855,14 +3908,24 @@ async fn handle_playbook_command(config: &Config, command: PlaybookCommands) -> 
                 println!("No playbooks found");
             } else {
                 println!("Available playbooks:");
-                for (name, entry) in playbooks {
-                    println!("  {} - {:?}", name, entry.path);
-                    if let Some(desc) = &entry.description {
-                        println!("    Description: {}", desc);
-                    }
-                    println!("    Added by: {} at {}", entry.added_by, entry.added_at.format("%Y-%m-%d %H:%M:%S"));
-                    if let Some(last_run) = &entry.last_run {
-                        println!("    Last run: {} (run count: {})", last_run.format("%Y-%m-%d %H:%M:%S"), entry.run_count);
+                for (name, path) in playbooks {
+                    println!("  {} - {:?}", name, path);
+                    
+                    // Try to read metadata if it exists
+                    let metadata_path = path.join(".laszoo-metadata.json");
+                    if metadata_path.exists() {
+                        if let Ok(content) = std::fs::read_to_string(&metadata_path) {
+                            if let Ok(metadata) = serde_json::from_str::<crate::playbook::PlaybookMetadata>(&content) {
+                                if let Some(desc) = &metadata.description {
+                                    println!("    Description: {}", desc);
+                                }
+                                if let Some(last_run) = &metadata.last_run {
+                                    println!("    Last run: {} (run count: {})", 
+                                            last_run.format("%Y-%m-%d %H:%M:%S"), 
+                                            metadata.run_count);
+                                }
+                            }
+                        }
                     }
                 }
             }

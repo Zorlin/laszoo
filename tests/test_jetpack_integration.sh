@@ -15,11 +15,14 @@ TEST_DIR="/tmp/laszoo-jetpack-test-$$"
 TEST_PLAYBOOK_DIR="$TEST_DIR/playbooks"
 MFS_MOUNT="${MFS_MOUNT:-/mnt/laszoo}"
 
-# Check if we need sudo for MooseFS operations
-if [[ -w "$MFS_MOUNT" ]]; then
+# Check if running with sudo
+if [ "$EUID" -eq 0 ]; then 
+    echo "Running tests as root (sudo already applied)"
     SUDO=""
 else
-    SUDO="sudo"
+    echo "Running tests as regular user - Laszoo will escalate privileges as needed"
+    echo "You may be prompted for your sudo password by the application"
+    SUDO=""
 fi
 
 # Test counters
@@ -121,7 +124,9 @@ test_playbook_list() {
     $SUDO "$LASZOO_BIN" playbook add "$TEST_PLAYBOOK_DIR/list-test" --name "$playbook_name" >/dev/null 2>&1
     
     # List playbooks and check if our test playbook appears
-    if "$LASZOO_BIN" playbook list 2>/dev/null | grep -q "$playbook_name"; then
+    # Capture output to avoid broken pipe error
+    local list_output=$("$LASZOO_BIN" playbook list 2>/dev/null || true)
+    if echo "$list_output" | grep -q "$playbook_name"; then
         $SUDO "$LASZOO_BIN" playbook remove "$playbook_name" >/dev/null 2>&1
         return 0
     fi
@@ -193,7 +198,12 @@ test_playbook_path_resolution() {
         
         # Check if it was created at custom path
         if [[ -d "$MFS_MOUNT/testing/custom-path" ]]; then
-            sudo rm -rf "$MFS_MOUNT/testing/custom-path"
+            # Clean up custom path if we have permissions
+        if [[ -w "$MFS_MOUNT/testing/custom-path" ]]; then
+            rm -rf "$MFS_MOUNT/testing/custom-path"
+        else
+            echo "Warning: Cannot clean up $MFS_MOUNT/testing/custom-path - insufficient permissions"
+        fi
             return 0
         fi
     fi
@@ -210,7 +220,7 @@ test_inventory_sync_with_groups() {
 }
 
 test_playbook_manifest() {
-    # Check if playbook manifest exists after adding a playbook
+    # Check if playbook metadata exists after adding a playbook
     local playbook_name="test-manifest-$$"
     
     mkdir -p "$TEST_PLAYBOOK_DIR/manifest-test"
@@ -218,11 +228,14 @@ test_playbook_manifest() {
     
     $SUDO "$LASZOO_BIN" playbook add "$TEST_PLAYBOOK_DIR/manifest-test" --name "$playbook_name" >/dev/null 2>&1
     
-    if [[ -f "$MFS_MOUNT/playbooks/manifest.json" ]]; then
-        # Check if manifest contains our playbook
-        if grep -q "$playbook_name" "$MFS_MOUNT/playbooks/manifest.json" 2>/dev/null; then
-            $SUDO "$LASZOO_BIN" playbook remove "$playbook_name" >/dev/null 2>&1
-            return 0
+    # Check if the playbook directory and metadata file exist
+    if [[ -d "$MFS_MOUNT/playbooks/$playbook_name" ]]; then
+        if [[ -f "$MFS_MOUNT/playbooks/$playbook_name/.laszoo-metadata.json" ]]; then
+            # Check if metadata contains our playbook name
+            if grep -q "$playbook_name" "$MFS_MOUNT/playbooks/$playbook_name/.laszoo-metadata.json" 2>/dev/null; then
+                $SUDO "$LASZOO_BIN" playbook remove "$playbook_name" >/dev/null 2>&1
+                return 0
+            fi
         fi
     fi
     

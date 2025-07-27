@@ -78,7 +78,8 @@ mime_guess = "2.0"
 jetpack = { path = "../jetpack" }
 
 # Privilege escalation
-sudo = "0.6"
+# Process handling
+nix = { version = "0.29", features = ["user"] }
 
 [features]
 default = ["gamepad"]

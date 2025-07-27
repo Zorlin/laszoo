@@ -1469,6 +1469,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "mime_guess",
+ "nix",
  "notify",
  "regex",
  "reqwest",
@@ -1477,7 +1478,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "similar",
- "sudo",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -2592,16 +2592,6 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
-name = "sudo"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88bd84d4c082e18e37fef52c0088e4407dabcef19d23a607fb4b5ee03b7d5b83"
-dependencies = [
- "libc",
- "log",
-]
 
 [[package]]
 name = "syn"
