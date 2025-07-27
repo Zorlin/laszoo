@@ -11,7 +11,11 @@
       "Bash(cargo test:*)",
       "Bash(grep:*)",
       "Bash(cargo check:*)",
-      "Bash(./target/release/laszoo:*)"
+      "Bash(./target/release/laszoo:*)",
+      "Bash(dpkg:*)",
+      "Bash(sudo systemctl stop:*)",
+      "Bash(sudo RUST_LOG=debug laszoo watch -a --hard)",
+      "Bash(RUST_LOG=debug ./target/release/laszoo apply desktop)"
     ],
     "deny": []
   },

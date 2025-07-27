@@ -182,41 +182,9 @@ impl PackageManager {
 
     /// Parse a single package line
     fn parse_package_line(&self, line: &str) -> Result<Option<PackageOperation>> {
-        // Handle update all: ++update or ++update --before cmd --after cmd
+        // Handle update all: ++update (no before/after actions)
         if line.starts_with("++update") {
-            let mut start_action = None;
-            let mut end_action = None;
-            
-            // Parse --before and --after flags
-            if line.contains("--before") || line.contains("--after") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                let mut i = 0;
-                while i < parts.len() {
-                    if parts[i] == "--before" && i + 1 < parts.len() {
-                        // Collect all parts until next flag or end
-                        let mut cmd_parts = vec![];
-                        i += 1;
-                        while i < parts.len() && !parts[i].starts_with("--") {
-                            cmd_parts.push(parts[i]);
-                            i += 1;
-                        }
-                        start_action = Some(cmd_parts.join(" "));
-                    } else if parts[i] == "--after" && i + 1 < parts.len() {
-                        // Collect all parts until next flag or end
-                        let mut cmd_parts = vec![];
-                        i += 1;
-                        while i < parts.len() && !parts[i].starts_with("--") {
-                            cmd_parts.push(parts[i]);
-                            i += 1;
-                        }
-                        end_action = Some(cmd_parts.join(" "));
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            
-            return Ok(Some(PackageOperation::UpdateAll { start_action, end_action }));
+            return Ok(Some(PackageOperation::UpdateAll { start_action: None, end_action: None }));
         }
         
         // Handle upgrade all: ++upgrade or ++upgrade --before cmd --after cmd
@@ -367,6 +335,19 @@ impl PackageManager {
         Ok(None)
     }
 
+    /// Load package operations for a group (excluding system operations)
+    pub fn load_package_operations_only(&self, group: &str, hostname: Option<&str>) -> Result<Vec<PackageOperation>> {
+        let all_ops = self.load_package_operations(group, hostname)?;
+        Ok(all_ops.into_iter().filter(|op| {
+            !matches!(op, 
+                PackageOperation::UpdateAll { .. } |
+                PackageOperation::UpgradeAll { .. } |
+                PackageOperation::DistUpgradeAll { .. } |
+                PackageOperation::FullUpgradeAll { .. }
+            )
+        }).collect())
+    }
+    
     /// Load package operations for a group and optionally a specific machine
     pub fn load_package_operations(&self, group: &str, hostname: Option<&str>) -> Result<Vec<PackageOperation>> {
         let mut operations = Vec::new();
@@ -568,7 +549,6 @@ impl PackageManager {
         content.push_str("# ^package - Upgrade package\n");
         content.push_str("# ^package --upgrade=command - Upgrade with post-action\n");
         content.push_str("# ++update - Update package lists\n");
-        content.push_str("# ++update --before cmd --after cmd - Update with before/after actions\n");
         content.push_str("# ++upgrade - Upgrade all packages\n");
         content.push_str("# ++upgrade --before cmd --after cmd - Upgrade all with before/after actions\n");
         content.push_str("# ++dist-upgrade - Distribution upgrade all packages\n");
@@ -590,15 +570,8 @@ impl PackageManager {
                         content.push_str(&format!("^{}\n", name));
                     }
                 }
-                PackageOperation::UpdateAll { start_action, end_action } => {
-                    let mut line = String::from("++update");
-                    if let Some(start) = start_action {
-                        line.push_str(&format!(" --before {}", start));
-                    }
-                    if let Some(end) = end_action {
-                        line.push_str(&format!(" --after {}", end));
-                    }
-                    content.push_str(&format!("{}\n", line));
+                PackageOperation::UpdateAll { .. } => {
+                    content.push_str("++update\n");
                 }
                 PackageOperation::UpgradeAll { start_action, end_action } => {
                     let mut line = String::from("++upgrade");
@@ -654,6 +627,110 @@ impl PackageManager {
         detect_package_manager()
             .ok_or_else(|| LaszooError::Other("No supported package manager found".to_string()))
     }
+    
+    /// Wait for the package manager to be available (not locked)
+    async fn wait_for_package_manager(&self, pkg_mgr: &PackageManagerType) -> Result<()> {
+        use tokio::time::{sleep, Duration};
+        use std::process::Command;
+        
+        let mut printed_waiting = false;
+        
+        loop {
+            // Check if package manager is locked
+            let is_locked = match pkg_mgr {
+                PackageManagerType::Apt => {
+                    // Check if dpkg lock is held
+                    Command::new("fuser")
+                        .args(&["/var/lib/dpkg/lock-frontend"])
+                        .output()
+                        .map(|output| output.status.success())
+                        .unwrap_or(false)
+                }
+                PackageManagerType::Yum => {
+                    // Check if yum lock exists
+                    std::path::Path::new("/var/run/yum.pid").exists()
+                }
+                PackageManagerType::Dnf => {
+                    // Check if dnf lock exists
+                    std::path::Path::new("/var/cache/dnf/*.lock").exists()
+                }
+                PackageManagerType::Pacman => {
+                    // Check if pacman lock exists
+                    std::path::Path::new("/var/lib/pacman/db.lck").exists()
+                }
+                PackageManagerType::Zypper => {
+                    // Check if zypper is running
+                    Command::new("pgrep")
+                        .arg("zypper")
+                        .output()
+                        .map(|output| output.status.success())
+                        .unwrap_or(false)
+                }
+                PackageManagerType::Apk => {
+                    // Check if apk lock exists
+                    std::path::Path::new("/var/lock/apk").exists()
+                }
+            };
+            
+            if !is_locked {
+                if printed_waiting {
+                    info!("Package manager is now available");
+                }
+                break;
+            }
+            
+            if !printed_waiting {
+                info!("Waiting for package manager to be available");
+                printed_waiting = true;
+            } else {
+                debug!("Package manager still locked, waiting...");
+            }
+            
+            sleep(Duration::from_secs(2)).await;
+        }
+        
+        Ok(())
+    }
+    
+    /// Check if a package is already installed
+    async fn is_package_installed(&self, pkg_mgr: &PackageManagerType, package: &str) -> Result<bool> {
+        use tokio::process::Command;
+        
+        let output = match pkg_mgr {
+            PackageManagerType::Apt => {
+                Command::new("dpkg")
+                    .args(&["-l", package])
+                    .output()
+                    .await?
+            }
+            PackageManagerType::Yum | PackageManagerType::Dnf => {
+                Command::new("rpm")
+                    .args(&["-q", package])
+                    .output()
+                    .await?
+            }
+            PackageManagerType::Pacman => {
+                Command::new("pacman")
+                    .args(&["-Q", package])
+                    .output()
+                    .await?
+            }
+            PackageManagerType::Zypper => {
+                Command::new("rpm")
+                    .args(&["-q", package])
+                    .output()
+                    .await?
+            }
+            PackageManagerType::Apk => {
+                Command::new("apk")
+                    .args(&["info", "-e", package])
+                    .output()
+                    .await?
+            }
+        };
+        
+        Ok(output.status.success())
+    }
 
     /// Apply package operations on the local system with group context
     pub async fn apply_operations_with_group(&self, operations: &[PackageOperation], group: Option<&str>) -> Result<()> {
@@ -662,11 +739,34 @@ impl PackageManager {
             .to_string_lossy()
             .to_string();
         
+        // Get current state of all packages mentioned in operations
+        let mut package_states = std::collections::HashMap::new();
+        for op in operations {
+            match op {
+                PackageOperation::Install { name } |
+                PackageOperation::Remove { name } |
+                PackageOperation::Purge { name } |
+                PackageOperation::Upgrade { name, .. } => {
+                    debug!("Checking if package '{}' is installed", name);
+                    let installed = self.is_package_installed(&pkg_mgr, &name).await?;
+                    debug!("Package '{}' installed: {}", name, installed);
+                    package_states.insert(name.clone(), installed);
+                }
+                _ => {} // System operations don't need state check
+            }
+        }
+        
         for op in operations {
             match op {
                 PackageOperation::Install { name } => {
-                    info!("Installing package: {}", name);
-                    self.install_package(&pkg_mgr, name).await?;
+                    if let Some(&installed) = package_states.get(name) {
+                        if !installed {
+                            info!("Installing package: {}", name);
+                            self.install_package(&pkg_mgr, name).await?;
+                        } else {
+                            debug!("Package {} already installed, skipping", name);
+                        }
+                    }
                 }
                 PackageOperation::Upgrade { name, post_action } => {
                     info!("Upgrading package: {}", name);
@@ -677,7 +777,7 @@ impl PackageManager {
                         self.run_command(action).await?;
                     }
                 }
-                PackageOperation::UpdateAll { start_action, end_action } => {
+                PackageOperation::UpdateAll { .. } => {
                     // Record action start
                     let action_record = ActionRecord {
                         timestamp: Utc::now(),
@@ -689,11 +789,6 @@ impl PackageManager {
                         details: None,
                     };
                     let _ = self.record_action(&action_record);
-                    
-                    if let Some(action) = start_action {
-                        info!("Running pre-update action: {}", action);
-                        self.run_command(action).await?;
-                    }
                     
                     info!("Updating package lists");
                     match self.system_update(&pkg_mgr).await {
@@ -724,11 +819,6 @@ impl PackageManager {
                             let _ = self.record_action(&action_record);
                             return Err(e);
                         }
-                    }
-                    
-                    if let Some(action) = end_action {
-                        info!("Running post-update action: {}", action);
-                        self.run_command(action).await?;
                     }
                 }
                 PackageOperation::UpgradeAll { start_action, end_action } => {
@@ -923,12 +1013,26 @@ impl PackageManager {
                     }
                 }
                 PackageOperation::Remove { name } => {
-                    info!("Removing package: {}", name);
-                    self.remove_package(&pkg_mgr, name).await?;
+                    if let Some(&installed) = package_states.get(name) {
+                        if installed {
+                            info!("Removing package: {}", name);
+                            self.remove_package(&pkg_mgr, name).await?;
+                        } else {
+                            debug!("Package {} not installed, skipping removal", name);
+                        }
+                    } else {
+                        warn!("No state information for package {} to remove", name);
+                    }
                 }
                 PackageOperation::Purge { name } => {
-                    info!("Purging package: {}", name);
-                    self.purge_package(&pkg_mgr, name).await?;
+                    if let Some(&installed) = package_states.get(name) {
+                        if installed {
+                            info!("Purging package: {}", name);
+                            self.purge_package(&pkg_mgr, name).await?;
+                        } else {
+                            debug!("Package {} not installed, skipping purge", name);
+                        }
+                    }
                 }
                 PackageOperation::Keep { name } => {
                     debug!("Keeping package: {} (no action needed)", name);
@@ -946,6 +1050,9 @@ impl PackageManager {
 
     /// Install a package using the appropriate package manager
     async fn install_package(&self, pkg_mgr: &PackageManagerType, package: &str) -> Result<()> {
+        // Wait for package manager to be available
+        self.wait_for_package_manager(pkg_mgr).await?;
+        
         let cmd = match pkg_mgr {
             PackageManagerType::Apt => format!("apt-get install -y {}", package),
             PackageManagerType::Yum => format!("yum install -y {}", package),
@@ -960,6 +1067,9 @@ impl PackageManager {
 
     /// Upgrade a package
     async fn upgrade_package(&self, pkg_mgr: &PackageManagerType, package: &str) -> Result<()> {
+        // Wait for package manager to be available
+        self.wait_for_package_manager(pkg_mgr).await?;
+        
         let cmd = match pkg_mgr {
             PackageManagerType::Apt => format!("apt-get install --only-upgrade -y {}", package),
             PackageManagerType::Yum => format!("yum update -y {}", package),
@@ -974,6 +1084,9 @@ impl PackageManager {
 
     /// Remove a package
     async fn remove_package(&self, pkg_mgr: &PackageManagerType, package: &str) -> Result<()> {
+        // Wait for package manager to be available
+        self.wait_for_package_manager(pkg_mgr).await?;
+        
         let cmd = match pkg_mgr {
             PackageManagerType::Apt => format!("apt-get remove -y {}", package),
             PackageManagerType::Yum => format!("yum remove -y {}", package),
@@ -988,6 +1101,9 @@ impl PackageManager {
 
     /// Purge a package
     async fn purge_package(&self, pkg_mgr: &PackageManagerType, package: &str) -> Result<()> {
+        // Wait for package manager to be available
+        self.wait_for_package_manager(pkg_mgr).await?;
+        
         let cmd = match pkg_mgr {
             PackageManagerType::Apt => format!("apt-get purge -y {}", package),
             PackageManagerType::Yum => format!("yum remove -y {}", package), // No purge in yum
@@ -1002,6 +1118,9 @@ impl PackageManager {
 
     /// Run a system update (refresh package lists)
     pub async fn system_update(&self, pkg_mgr: &PackageManagerType) -> Result<()> {
+        // Wait for package manager to be available
+        self.wait_for_package_manager(pkg_mgr).await?;
+        
         let cmd = match pkg_mgr {
             PackageManagerType::Apt => "apt-get update",
             PackageManagerType::Yum => "yum check-update || true", // check-update returns 100 if updates available
@@ -1016,6 +1135,9 @@ impl PackageManager {
 
     /// Run a system upgrade
     pub async fn system_upgrade(&self, pkg_mgr: &PackageManagerType) -> Result<()> {
+        // Wait for package manager to be available
+        self.wait_for_package_manager(pkg_mgr).await?;
+        
         let cmd = match pkg_mgr {
             PackageManagerType::Apt => "apt-get upgrade -y",
             PackageManagerType::Yum => "yum upgrade -y",
@@ -1030,6 +1152,9 @@ impl PackageManager {
 
     /// Run a distribution upgrade
     pub async fn system_dist_upgrade(&self, pkg_mgr: &PackageManagerType) -> Result<()> {
+        // Wait for package manager to be available
+        self.wait_for_package_manager(pkg_mgr).await?;
+        
         let cmd = match pkg_mgr {
             PackageManagerType::Apt => "apt-get dist-upgrade -y",
             PackageManagerType::Yum => "yum upgrade -y", // yum doesn't have dist-upgrade
@@ -1044,6 +1169,9 @@ impl PackageManager {
 
     /// Run a full upgrade (same as dist-upgrade on most systems)
     pub async fn system_full_upgrade(&self, pkg_mgr: &PackageManagerType) -> Result<()> {
+        // Wait for package manager to be available
+        self.wait_for_package_manager(pkg_mgr).await?;
+        
         let cmd = match pkg_mgr {
             PackageManagerType::Apt => "apt-get full-upgrade -y",
             PackageManagerType::Yum => "yum upgrade -y", // yum doesn't have full-upgrade

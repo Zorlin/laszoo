@@ -17,6 +17,7 @@ use clap::Parser;
 use tracing::{info, error, debug, warn};
 use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
+use std::os::unix::process::CommandExt;
 
 #[derive(Debug, Clone, Copy)]
 enum PackageStatus {
@@ -32,10 +33,98 @@ use crate::{
     error::{Result, LaszooError},
 };
 
+/// Check if we can use sudo without a password
+fn can_sudo_without_password() -> bool {
+    use std::process::Command;
+    
+    // Try to run sudo -n true (non-interactive test)
+    match Command::new("sudo")
+        .args(&["-n", "true"])
+        .output()
+    {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
+}
+
+/// Check if running as root
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Check if a command requires root privileges
+fn requires_root(command: &Commands) -> bool {
+    use Commands::*;
+    
+    match command {
+        // These commands modify system files and need root
+        Enroll { .. } => true,
+        Unenroll { .. } => true,
+        Apply { .. } => true,
+        Watch { .. } => true,
+        Service { .. } => true,
+        
+        // Package commands need root to install/remove packages
+        Install { .. } => true,
+        Uninstall { .. } => true,
+        Patch { .. } => true,
+        
+        // These commands are read-only or user-level
+        Status { .. } => false,
+        Init { .. } => false,
+        Groups { command } => match command {
+            GroupsCommands::List => false,
+        },
+        Diff { .. } => false,
+        WebUI { .. } => false,
+        Commit { .. } => false,
+        Rollback { .. } => false,
+        
+        // Group commands that modify membership need root
+        Group { command, .. } => match command {
+            GroupCommands::Add { .. } => true,
+            GroupCommands::Remove { .. } => true,
+            GroupCommands::List => false,
+            GroupCommands::Rename { .. } => true,
+        },
+    }
+}
+
+/// Re-execute the current command with sudo
+fn reexec_with_sudo() -> ! {
+    use std::os::unix::process::CommandExt;
+    use std::env;
+    
+    let args: Vec<String> = env::args().collect();
+    
+    // Build the sudo command
+    let err = std::process::Command::new("sudo")
+        .args(&args)
+        .exec();
+    
+    // If exec fails, we'll reach here
+    eprintln!("Failed to execute sudo: {}", err);
+    std::process::exit(1);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse CLI arguments
     let cli = Cli::parse();
+
+    // Check if the command requires root and we're not root
+    if requires_root(&cli.command) && !is_root() {
+        if can_sudo_without_password() {
+            // We can use sudo without a password, so re-exec with sudo
+            println!("Elevating privileges with sudo...");
+            reexec_with_sudo();
+        } else {
+            // Can't use sudo without password
+            eprintln!("This command requires root privileges.");
+            eprintln!("Please run with sudo: sudo {}", std::env::args().collect::<Vec<_>>().join(" "));
+            std::process::exit(1);
+        }
+    }
 
     // Load configuration
     let config = Config::load(cli.config.as_deref())?;
@@ -809,7 +898,8 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                             let status = check_package_status(&system_pkg_mgr, name).await;
                             let display_status = match status {
                                 PackageStatus::Missing => PackageStatus::UpToDate, // Good - it should be missing
-                                _ => PackageStatus::UpToDate, // If installed, that's wrong but we don't show as error
+                                PackageStatus::UpToDate => PackageStatus::PendingUpdates, // Package is installed but shouldn't be
+                                _ => status, // Keep other statuses as-is
                             };
                             package_statuses.push((format!("!{}", name), display_status));
                         }
@@ -1898,6 +1988,7 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
     let mut committed_template_changes = HashSet::new(); // Track template changes that have been committed
     let mut ignore_file_changes = HashSet::new(); // Track files we're currently applying templates to (ignore subsequent changes)
     let mut ignore_file_timestamps: HashMap<PathBuf, std::time::Instant> = HashMap::new(); // Track when files were added to ignore list
+    let mut auto_synced_files: HashSet<PathBuf> = HashSet::new(); // Track files that were auto-synced to avoid double processing
     let debounce_duration = Duration::from_millis(500);
     let mut last_event_time = std::time::Instant::now();
     let mut last_template_time = std::time::Instant::now();
@@ -2080,6 +2171,47 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
                                 "✗"  // Deleted
                             };
                             println!("  {} {} (group: {})", status_char, path.display(), group);
+                            
+                            // In auto + hard mode, immediately handle new files and deleted files
+                            if auto && hard {
+                                if status_char == "?" && path.exists() {
+                                    // Check if it's within an enrolled directory
+                                    if let Ok(Some((found_group, _enrolled_dir))) = enrollment_manager.is_file_within_enrolled_directory(path) {
+                                        if found_group == group {
+                                            println!("  → Creating template for new file in enrolled directory");
+                                            
+                                            // Create template immediately for new file
+                                            let template_path = enrollment_manager.get_group_template_path(&group, path)?;
+                                            match enrollment_manager.enroll_file(path, &group, false, false, false, None, None).await {
+                                                Ok(()) => {
+                                                    println!("  ✓ Created template for new file");
+                                                    local_template_changes.insert(template_path);
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to create template for new file {}: {}", path.display(), e);
+                                                    println!("  ✗ Failed to create template: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else if status_char == "✗" && !path.exists() {
+                                    // File was deleted - delete the template in hard mode
+                                    let template_path = enrollment_manager.get_group_template_path(&group, path)?;
+                                    if template_path.exists() {
+                                        println!("  → Deleting template for removed file");
+                                        match std::fs::remove_file(&template_path) {
+                                            Ok(()) => {
+                                                println!("  ✓ Deleted template for removed file");
+                                                local_template_changes.insert(template_path);
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to delete template for removed file {}: {}", path.display(), e);
+                                                println!("  ✗ Failed to delete template: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -2125,30 +2257,31 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
                                     };
                                     
                                     if needs_enrollment && within_enrolled_dir.is_some() {
-                                        let (found_group, enrolled_dir) = within_enrolled_dir.unwrap();
+                                        let (found_group, _enrolled_dir) = within_enrolled_dir.unwrap();
                                         
-                                        // Only auto-enroll if it's in the same group
+                                        // Only process if it's in the same group
                                         if found_group == group_name {
-                                            // Check auto-enrollment settings
-                                            let should_auto_enroll = if hard {
-                                                // In hard mode, always auto-enroll
-                                                true
-                                            } else {
-                                                // In soft mode, just discover but don't enroll
-                                                false
-                                            };
-                                            
-                                            if should_auto_enroll {
-                                                println!("  → Auto-enrolling new file: {}", path.display());
-                                                match enrollment_manager.auto_enroll_file(path, &group_name, &enrolled_dir).await {
-                                                    Ok(()) => {
-                                                        println!("  ✓ Auto-enrolled file: {}", path.display());
-                                                        // Track this template change for committing
-                                                        local_template_changes.insert(template_path);
+                                            // Files within enrolled directories are automatically covered
+                                            // by the directory enrollment - no need to create individual entries
+                                            if hard {
+                                                println!("  → Processing new file in enrolled directory: {}", path.display());
+                                                // Just handle it as a normal file change - create template
+                                                match handle_file_change(
+                                                    &enrollment_manager,
+                                                    path,
+                                                    &group_name,
+                                                    &sync_action,
+                                                    hard,
+                                                ).await {
+                                                    Ok(template_changed) => {
+                                                        if template_changed {
+                                                            println!("  ✓ Created template for new file: {}", path.display());
+                                                            local_template_changes.insert(template_path);
+                                                        }
                                                     }
                                                     Err(e) => {
-                                                        error!("Failed to auto-enroll file {}: {}", path.display(), e);
-                                                        println!("  ✗ Failed to auto-enroll: {}", e);
+                                                        error!("Failed to process new file {}: {}", path.display(), e);
+                                                        println!("  ✗ Failed to process new file: {}", e);
                                                     }
                                                 }
                                             } else {
@@ -2368,6 +2501,56 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
                         ignore_file_timestamps.remove(&path);
                         debug!("Expired ignore for file: {:?}", path);
                     }
+                    
+                    // Check for deleted templates (templates that were known but no longer exist)
+                    if hard {
+                        let mut deleted_templates = Vec::new();
+                        for template_path in &known_templates {
+                            if !template_path.exists() {
+                                deleted_templates.push(template_path.clone());
+                            }
+                        }
+                        
+                        for template_path in deleted_templates {
+                            // Remove from tracking
+                            known_templates.remove(&template_path);
+                            known_template_checksums.remove(&template_path);
+                            known_template_timestamps.remove(&template_path);
+                            
+                            // Extract the original file path from template path
+                            for group_name in &groups_to_watch {
+                                let group_dir = crate::fs::get_group_dir(&config.mfs_mount, "", group_name);
+                                if let Ok(relative_path) = template_path.strip_prefix(&group_dir) {
+                                    let path_str = relative_path.to_string_lossy();
+                                    if path_str.ends_with(".lasz") {
+                                        let original_path = PathBuf::from("/").join(&path_str[..path_str.len() - 5]);
+                                        
+                                        println!("\n[{}] Template deleted: {}",
+                                            chrono::Local::now().format("%H:%M:%S"),
+                                            template_path.display()
+                                        );
+                                        
+                                        // In hard mode, delete the corresponding local file
+                                        if original_path.exists() {
+                                            println!("  → Deleting local file to match template deletion");
+                                            match std::fs::remove_file(&original_path) {
+                                                Ok(()) => {
+                                                    println!("  ✓ Deleted local file: {}", original_path.display());
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to delete local file {}: {}", original_path.display(), e);
+                                                    println!("  ✗ Failed to delete local file: {}", e);
+                                                }
+                                            }
+                                        } else {
+                                            println!("  → Local file already deleted: {}", original_path.display());
+                                        }
+                                        break; // Found the group this template belongs to
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     last_template_scan = std::time::Instant::now();
                 }
@@ -2396,12 +2579,44 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
                                         
                                         // Apply package changes if auto mode is enabled
                                         if auto {
-                                            println!("  → Auto-applying package changes...");
-                                            if let Err(e) = apply_packages_for_group(config, group_name).await {
-                                                error!("Failed to apply package changes: {}", e);
-                                                println!("  ✗ Failed to apply package changes: {}", e);
-                                            } else {
-                                                println!("  ✓ Package changes applied");
+                                            // Check if this is just package changes or includes system operations
+                                            use crate::package::PackageManager;
+                                            let pkg_manager = PackageManager::new(config.mfs_mount.clone());
+                                            let hostname = gethostname::gethostname().to_string_lossy().to_string();
+                                            
+                                            match pkg_manager.load_package_operations(group_name, Some(&hostname)) {
+                                                Ok(operations) => {
+                                                    let has_system_ops = operations.iter().any(|op| matches!(op,
+                                                        crate::package::PackageOperation::UpdateAll { .. } |
+                                                        crate::package::PackageOperation::UpgradeAll { .. } |
+                                                        crate::package::PackageOperation::DistUpgradeAll { .. } |
+                                                        crate::package::PackageOperation::FullUpgradeAll { .. }
+                                                    ));
+                                                    
+                                                    if has_system_ops && check_for_unexecuted_commands(config, group_name).await {
+                                                        // Has system operations that haven't been executed
+                                                        println!("  → Auto-applying package and system changes...");
+                                                        if let Err(e) = apply_packages_for_group(config, group_name).await {
+                                                            error!("Failed to apply package changes: {}", e);
+                                                            println!("  ✗ Failed to apply package changes: {}", e);
+                                                        } else {
+                                                            println!("  ✓ Package and system changes applied");
+                                                        }
+                                                    } else {
+                                                        // Only package changes
+                                                        println!("  → Auto-applying package changes...");
+                                                        debug!("Applying package-only operations for group '{}'", group_name);
+                                                        if let Err(e) = apply_packages_only_for_group(config, group_name).await {
+                                                            error!("Failed to apply package changes: {}", e);
+                                                            println!("  ✗ Failed to apply package changes: {}", e);
+                                                        } else {
+                                                            println!("  ✓ Package changes applied");
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to load package operations: {}", e);
+                                                }
                                             }
                                         } else {
                                             println!("  → Package changes detected (manual mode - run 'laszoo install {} --apply' to apply)", group_name);
@@ -2776,8 +2991,8 @@ async fn install_packages(config: &Config, group: &str, packages: Vec<String>, a
         info!("Laszoo watch is running, it will handle package installation");
     } else if in_group {
         info!("Laszoo watch not detected, applying package changes locally");
-        // Apply the entire packages.conf for this group
-        apply_packages_for_group(config, group).await?;
+        // Apply only package operations (not system operations)
+        apply_packages_only_for_group(config, group).await?;
     }
     
     // Run after command if provided
@@ -2872,9 +3087,9 @@ async fn uninstall_packages(config: &Config, group: &str, packages: Vec<String>,
             }
         }
         
-        // Apply the entire packages.conf for this group (which now includes the removal entries)
+        // Apply only package operations (not system operations)
         info!("Laszoo watch not detected, applying package changes locally");
-        apply_packages_for_group(config, group).await?;
+        apply_packages_only_for_group(config, group).await?;
     }
     
     // Run after command if provided
@@ -2972,6 +3187,55 @@ async fn check_for_unexecuted_commands(config: &Config, group: &str) -> bool {
             false
         }
     }
+}
+
+async fn apply_packages_only_for_group(config: &Config, group: &str) -> Result<()> {
+    use crate::package::PackageManager;
+    
+    let hostname = gethostname::gethostname()
+        .to_string_lossy()
+        .to_string();
+    
+    debug!("Checking if machine '{}' is in group '{}'", hostname, group);
+    
+    // Check if this machine is in the specified group
+    let groups_file = config.mfs_mount
+        .join("machines")
+        .join(&hostname)
+        .join("etc")
+        .join("laszoo")
+        .join("groups.conf");
+    
+    let in_group = if groups_file.exists() {
+        let content = std::fs::read_to_string(&groups_file)?;
+        content.lines()
+            .any(|line| line.trim() == group)
+    } else {
+        false
+    };
+    
+    if !in_group {
+        debug!("Machine is not in group '{}', skipping package application", group);
+        return Ok(());
+    }
+    
+    // Create package manager and load operations (excluding system operations)
+    let pkg_manager = PackageManager::new(config.mfs_mount.clone());
+    let operations = pkg_manager.load_package_operations_only(group, Some(&hostname))?;
+    
+    debug!("Loaded {} package operations for group '{}'", operations.len(), group);
+    for op in &operations {
+        debug!("  Operation: {:?}", op);
+    }
+    
+    if !operations.is_empty() {
+        info!("Applying {} package operations for group '{}'", operations.len(), group);
+        pkg_manager.apply_operations_with_group(&operations, Some(group)).await?;
+    } else {
+        debug!("No package operations to apply for group '{}'", group);
+    }
+    
+    Ok(())
 }
 
 async fn apply_packages_for_group(config: &Config, group: &str) -> Result<()> {

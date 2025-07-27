@@ -133,3 +133,10 @@ sudo ./target/release/laszoo <command>  # Some operations require root
 - Add action management (--before/--after triggers)
 - Implement package management system
 - Add compliance reporting
+
+# important-instruction-reminders
+Do what has been asked; nothing more, nothing less.
+NEVER create files unless they're absolutely necessary for achieving your goal.
+ALWAYS prefer editing an existing file to creating a new one.
+NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.
+NEVER MARK TASKS AS COMPLETED IN TODO UNTIL THEY HAVE BEEN TESTED AND VERIFIED TO WORK. Building without errors IS NOT THE SAME AS WORKING.
