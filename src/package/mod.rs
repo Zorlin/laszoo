@@ -799,10 +799,7 @@ impl PackageManager {
             .to_string_lossy()
             .to_string();
         
-        println!("DEBUG: Processing {} operations", operations.len());
-        for (i, op) in operations.iter().enumerate() {
-            println!("DEBUG: Operation {}: {:?}", i, op);
-        }
+        // Process operations
         
         // Collect all package names that need state checking
         let mut package_names = Vec::new();
@@ -821,11 +818,7 @@ impl PackageManager {
         }
         
         // Get current state of all packages in a single batch call
-        println!("DEBUG: Checking status of {} packages in batch: {:?}", package_names.len(), package_names);
         let package_states = self.get_package_states_batch(&pkg_mgr, &package_names).await?;
-        for (name, installed) in &package_states {
-            println!("DEBUG: Package '{}' installed: {}", name, installed);
-        }
         
         // Collect all packages that need to be installed in batch
         let mut packages_to_install = Vec::new();
@@ -833,27 +826,20 @@ impl PackageManager {
             if let PackageOperation::Install { name } = op {
                 if let Some(&installed) = package_states.get(name) {
                     if !installed {
-                        println!("DEBUG: Package '{}' not installed, adding to batch", name);
                         packages_to_install.push(name.clone());
-                    } else {
-                        println!("DEBUG: Package '{}' already installed, skipping", name);
                     }
-                } else {
-                    println!("DEBUG: No state information for package '{}'", name);
                 }
             }
         }
         
         // Install all missing packages in a single batch command
         if !packages_to_install.is_empty() {
-            println!("DEBUG: About to install {} packages in batch: {}", packages_to_install.len(), packages_to_install.join(" "));
             info!("Installing packages in batch: {}", packages_to_install.join(" "));
             match self.install_packages_batch(&pkg_mgr, &packages_to_install).await {
                 Ok(()) => {
-                    println!("DEBUG: Batch install completed successfully");
+                    // Batch install completed successfully
                 }
                 Err(e) => {
-                    println!("DEBUG: Batch install failed: {}", e);
                     // Try to install packages individually to identify which one failed
                     warn!("Batch install failed, attempting individual package installation");
                     for package in &packages_to_install {
@@ -870,8 +856,44 @@ impl PackageManager {
                     }
                 }
             }
-        } else {
-            println!("DEBUG: No packages to install in batch");
+        }
+        
+        // Collect all packages that need to be removed in batch
+        let mut packages_to_remove = Vec::new();
+        for op in operations {
+            if let PackageOperation::Remove { name } = op {
+                if let Some(&installed) = package_states.get(name) {
+                    if installed {
+                        packages_to_remove.push(name.clone());
+                    }
+                }
+            }
+        }
+        
+        // Remove all packages in a single batch command
+        if !packages_to_remove.is_empty() {
+            info!("Removing packages in batch: {}", packages_to_remove.join(" "));
+            match self.remove_packages_batch(&pkg_mgr, &packages_to_remove).await {
+                Ok(()) => {
+                    // Batch remove completed successfully
+                }
+                Err(e) => {
+                    // Try to remove packages individually to identify which one failed
+                    warn!("Batch remove failed, attempting individual package removal");
+                    for package in &packages_to_remove {
+                        match self.remove_package(&pkg_mgr, package).await {
+                            Ok(()) => {
+                                info!("Successfully removed package: {}", package);
+                            }
+                            Err(individual_err) => {
+                                error!("Failed to remove package '{}': {}", package, individual_err);
+                                // Record the failure for this specific package
+                                self.record_package_failure(group, package, "remove", &individual_err.to_string()).await;
+                            }
+                        }
+                    }
+                }
+            }
         }
         
         // Process remaining operations individually
@@ -1148,6 +1170,11 @@ impl PackageManager {
                     }
                 }
                 PackageOperation::Remove { name } => {
+                    // Skip if already handled in batch
+                    if packages_to_remove.contains(&name.clone()) {
+                        continue;
+                    }
+                    
                     if let Some(&installed) = package_states.get(name) {
                         if installed {
                             info!("Removing package: {}", name);
@@ -1215,7 +1242,6 @@ impl PackageManager {
             return Ok(());
         }
         
-        println!("DEBUG: install_packages_batch called with {} packages: {:?}", packages.len(), packages);
         
         // Wait for package manager to be available
         self.wait_for_package_manager(pkg_mgr).await?;
@@ -1230,10 +1256,30 @@ impl PackageManager {
             PackageManagerType::Apk => format!("apk add {}", packages_str),
         };
 
-        println!("DEBUG: About to run command: {}", cmd);
-        let result = self.run_command(&cmd).await;
-        println!("DEBUG: Command result: {:?}", result);
-        result
+        self.run_command(&cmd).await
+    }
+
+    /// Remove multiple packages in a single batch command
+    async fn remove_packages_batch(&self, pkg_mgr: &PackageManagerType, packages: &[String]) -> Result<()> {
+        if packages.is_empty() {
+            return Ok(());
+        }
+        
+        
+        // Wait for package manager to be available
+        self.wait_for_package_manager(pkg_mgr).await?;
+        
+        let packages_str = packages.join(" ");
+        let cmd = match pkg_mgr {
+            PackageManagerType::Apt => format!("apt-get remove -y {}", packages_str),
+            PackageManagerType::Yum => format!("yum remove -y {}", packages_str),
+            PackageManagerType::Dnf => format!("dnf remove -y {}", packages_str),
+            PackageManagerType::Pacman => format!("pacman -R --noconfirm {}", packages_str),
+            PackageManagerType::Zypper => format!("zypper remove -y {}", packages_str),
+            PackageManagerType::Apk => format!("apk del {}", packages_str),
+        };
+
+        self.run_command(&cmd).await
     }
 
     /// Upgrade a package
