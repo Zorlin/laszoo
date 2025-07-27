@@ -249,6 +249,52 @@ pub enum Commands {
         #[arg(short, long, default_value = "3")]
         context: usize,
     },
+    
+    /// Manage Jetpack playbooks
+    Playbook {
+        #[command(subcommand)]
+        command: PlaybookCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PlaybookCommands {
+    /// Add a playbook to the distributed storage
+    Add {
+        /// Path to the playbook directory or file
+        path: PathBuf,
+        
+        /// Optional name for the playbook (defaults to directory name)
+        #[arg(short, long)]
+        name: Option<String>,
+        
+        /// Custom path in the mount point to store the playbook
+        #[arg(short, long)]
+        path_override: Option<PathBuf>,
+    },
+    
+    /// List available playbooks
+    List,
+    
+    /// Run a playbook
+    Run {
+        /// Name or path of the playbook to run
+        name: String,
+        
+        /// Custom inventory path (defaults to /mnt/laszoo/inventory/jetpack)
+        #[arg(short, long)]
+        inventory: Option<PathBuf>,
+        
+        /// Additional arguments to pass to the playbook
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    
+    /// Remove a playbook from distributed storage
+    Remove {
+        /// Name of the playbook to remove
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

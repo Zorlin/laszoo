@@ -1,0 +1,19 @@
+[Unit]
+Description={{ app_name }} Application
+After=network.target
+
+[Service]
+Type=simple
+User={{ app_user }}
+WorkingDirectory={{ app_dir }}/code
+Environment="NODE_ENV=production"
+Environment="PORT={{ app_port }}"
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ app_name }}
+
+[Install]
+WantedBy=multi-user.target

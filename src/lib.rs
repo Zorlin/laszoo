@@ -12,3 +12,5 @@ pub mod package;
 pub mod action;
 pub mod service;
 pub mod webui;
+pub mod playbook;
+pub mod inventory;

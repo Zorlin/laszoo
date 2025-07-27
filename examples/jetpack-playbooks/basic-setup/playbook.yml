@@ -1,0 +1,102 @@
+# Basic System Setup Playbook for Laszoo + Jetpack
+# Performs basic system configuration
+
+- name: Basic system setup
+  groups:
+    - all
+  
+  sudo: root
+  
+  defaults:
+    timezone: "UTC"
+    locale: "en_US.UTF-8"
+    
+  tasks:
+    - !facts
+    
+    - !echo
+      msg: "Setting up {{ jet_hostname }}"
+    
+    # Set hostname
+    - !file
+      path: /etc/hostname
+      content: "{{ jet_hostname }}\n"
+    
+    # Configure timezone
+    - !shell
+      name: Set timezone
+      cmd: "timedatectl set-timezone {{ timezone }}"
+      changed_when: false
+    
+    # Install basic packages
+    - !apt
+      name: Install basic tools (Debian/Ubuntu)
+      package:
+        - htop
+        - vim
+        - curl
+        - wget
+        - git
+        - tmux
+      with:
+        condition: (eq jet_os_flavor "Debian")
+    
+    - !dnf
+      name: Install basic tools (RHEL/CentOS)
+      package:
+        - htop
+        - vim
+        - curl
+        - wget
+        - git
+        - tmux
+      with:
+        condition: (eq jet_os_flavor "EL")
+    
+    # Create admin user
+    - !user
+      name: admin
+      groups:
+        - sudo
+        - adm
+      shell: /bin/bash
+      create_home: true
+    
+    # Configure SSH
+    - !file
+      path: /etc/ssh/sshd_config.d/99-laszoo.conf
+      content: |
+        # Laszoo managed SSH configuration
+        PermitRootLogin prohibit-password
+        PasswordAuthentication no
+        X11Forwarding no
+        PrintMotd no
+        AcceptEnv LANG LC_*
+    
+    - !sd_service
+      name: sshd
+      state: reloaded
+    
+    # Setup firewall (UFW on Ubuntu)
+    - !shell
+      name: Configure UFW firewall
+      cmd: |
+        ufw --force enable
+        ufw allow 22/tcp
+        ufw allow 80/tcp
+        ufw allow 443/tcp
+      with:
+        condition: (eq jet_os_name "Ubuntu")
+    
+    # Create standard directories
+    - !directory
+      path: "{{ item }}"
+      mode: "0755"
+      with:
+        items:
+          - /opt/apps
+          - /opt/backups
+          - /var/log/apps
+    
+    - !echo
+      msg: "Basic setup completed on {{ jet_hostname }}"

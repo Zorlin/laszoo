@@ -1,0 +1,90 @@
+# Example: Web Application Deployment Playbook
+# This playbook demonstrates how to deploy a web application using Laszoo + Jetpack
+
+- name: Deploy web application
+  groups:
+    - webservers
+  
+  sudo: root
+  
+  defaults:
+    app_name: laszoo
+    app_port: 8080
+    app_user: laszoo
+    app_dir: "/opt/{{ app_name }}"
+    git_branch: main
+    
+  tasks:
+    - !facts
+    
+    - !user
+      name: "{{ app_user }}"
+      system: true
+      shell: /bin/bash
+      home: "{{ app_dir }}"
+      create_home: true
+    
+    # Install dependencies based on OS
+    - !apt
+      package: 
+        - git
+        - nodejs
+        - npm
+        - nginx
+      with:
+        condition: (eq jet_os_flavor "Debian")
+    
+    - !dnf
+      package:
+        - git
+        - nodejs
+        - npm
+        - nginx
+      with:
+        condition: (eq jet_os_flavor "EL")
+    
+    - !git
+      repo: "https://github.com/zorlin/laszoo.git"
+      path: "{{ app_dir }}/code"
+      branch: "{{ git_branch }}"
+      become: "{{ app_user }}"
+    
+    - !shell
+      name: Install npm dependencies
+      cmd: "cd {{ app_dir }}/code && npm install --production"
+      become: "{{ app_user }}"
+    
+    - !template
+      src: app.service.j2
+      dest: "/etc/systemd/system/{{ app_name }}.service"
+    
+    - !shell
+      name: Reload systemd
+      cmd: systemctl daemon-reload
+      changed_when: false
+    
+    - !template
+      src: nginx-site.conf.j2
+      dest: "/etc/nginx/sites-available/{{ app_name }}"
+    
+    - !file
+      path: "/etc/nginx/sites-enabled/{{ app_name }}"
+      src: "/etc/nginx/sites-available/{{ app_name }}"
+      state: link
+    
+    - !sd_service
+      name: "{{ app_name }}"
+      state: started
+      enabled: true
+    
+    - !sd_service
+      name: nginx
+      state: reloaded
+    
+    # Health check with retry
+    - !shell
+      name: Check application health
+      cmd: "curl -f http://localhost:{{ app_port }}/health"
+      with:
+        retry: 5
+        retry_delay: 3

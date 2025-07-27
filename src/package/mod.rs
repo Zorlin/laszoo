@@ -27,6 +27,8 @@ pub enum PackageOperation {
     Remove { name: String },
     /// !!!package - Purge package
     Purge { name: String },
+    /// ++playbook - Run a Jetpack playbook
+    RunPlaybook { name: String, args: Vec<String> },
 }
 
 /// Action record for tracking all operations
@@ -298,6 +300,20 @@ impl PackageManager {
             return Ok(Some(PackageOperation::FullUpgradeAll { start_action, end_action }));
         }
         
+        // Handle playbook: ++playbook name [args...]
+        if line.starts_with("++playbook") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 2 {
+                warn!("Invalid playbook line: {}", line);
+                return Ok(None);
+            }
+            
+            let name = parts[1].to_string();
+            let args = parts[2..].iter().map(|s| s.to_string()).collect();
+            
+            return Ok(Some(PackageOperation::RunPlaybook { name, args }));
+        }
+        
         // Handle upgrade with post-action: ^nginx --upgrade=systemctl restart nginx
         if line.starts_with('^') {
             let parts: Vec<&str> = line[1..].splitn(2, "--upgrade=").collect();
@@ -343,7 +359,8 @@ impl PackageManager {
                 PackageOperation::UpdateAll { .. } |
                 PackageOperation::UpgradeAll { .. } |
                 PackageOperation::DistUpgradeAll { .. } |
-                PackageOperation::FullUpgradeAll { .. }
+                PackageOperation::FullUpgradeAll { .. } |
+                PackageOperation::RunPlaybook { .. }
             )
         }).collect())
     }
@@ -366,7 +383,8 @@ impl PackageManager {
                     PackageOperation::UpdateAll { .. } |
                     PackageOperation::UpgradeAll { .. } |
                     PackageOperation::DistUpgradeAll { .. } |
-                    PackageOperation::FullUpgradeAll { .. } => {
+                    PackageOperation::FullUpgradeAll { .. } |
+                    PackageOperation::RunPlaybook { .. } => {
                         // These are special operations that don't have a package name
                         operations.push(op);
                     }
@@ -381,6 +399,7 @@ impl PackageManager {
                             PackageOperation::UpgradeAll { .. } => unreachable!(),
                             PackageOperation::DistUpgradeAll { .. } => unreachable!(),
                             PackageOperation::FullUpgradeAll { .. } => unreachable!(),
+                            PackageOperation::RunPlaybook { .. } => unreachable!(),
                         };
                         operation_map.insert(name.clone(), op);
                     }
@@ -402,7 +421,8 @@ impl PackageManager {
                         PackageOperation::UpdateAll { .. } |
                         PackageOperation::UpgradeAll { .. } |
                         PackageOperation::DistUpgradeAll { .. } |
-                        PackageOperation::FullUpgradeAll { .. } => {
+                        PackageOperation::FullUpgradeAll { .. } |
+                        PackageOperation::RunPlaybook { .. } => {
                             // These are special operations that don't have a package name
                             operations.push(op);
                         }
@@ -417,6 +437,7 @@ impl PackageManager {
                                 PackageOperation::UpgradeAll { .. } => unreachable!(),
                                 PackageOperation::DistUpgradeAll { .. } => unreachable!(),
                                 PackageOperation::FullUpgradeAll { .. } => unreachable!(),
+                                PackageOperation::RunPlaybook { .. } => unreachable!(),
                             };
                             operation_map.insert(name.clone(), op);
                         }
@@ -558,7 +579,8 @@ impl PackageManager {
         content.push_str("# +package - Install package\n");
         content.push_str("# =package - Keep package (don't auto-install/remove)\n");
         content.push_str("# !package - Remove package\n");
-        content.push_str("# !!!package - Purge package\n\n");
+        content.push_str("# !!!package - Purge package\n");
+        content.push_str("# ++playbook name [args...] - Run a Jetpack playbook\n\n");
 
         // Write operations
         for op in operations {
@@ -614,6 +636,13 @@ impl PackageManager {
                 }
                 PackageOperation::Purge { name } => {
                     content.push_str(&format!("!!!{}\n", name));
+                }
+                PackageOperation::RunPlaybook { name, args } => {
+                    let mut line = format!("++playbook {}", name);
+                    for arg in args {
+                        line.push_str(&format!(" {}", arg));
+                    }
+                    content.push_str(&format!("{}\n", line));
                 }
             }
         }
@@ -1208,6 +1237,57 @@ impl PackageManager {
                 PackageOperation::Keep { name } => {
                     debug!("Keeping package: {} (no action needed)", name);
                 }
+                PackageOperation::RunPlaybook { name, args } => {
+                    info!("Running playbook: {}", name);
+                    
+                    // Record action start
+                    let action_record = ActionRecord {
+                        timestamp: Utc::now(),
+                        hostname: gethostname::gethostname().to_string_lossy().to_string(),
+                        action_type: "playbook_run".to_string(),
+                        target: name.clone(),
+                        group: group.map(|s| s.to_string()),
+                        status: "started".to_string(),
+                        details: Some(format!("args: {:?}", args)),
+                    };
+                    self.record_action(&action_record)?;
+                    
+                    // Run the playbook using PlaybookManager
+                    match self.run_playbook(name, args).await {
+                        Ok(_) => {
+                            info!("Playbook {} completed successfully", name);
+                            
+                            // Record action completion
+                            let action_record = ActionRecord {
+                                timestamp: Utc::now(),
+                                hostname: gethostname::gethostname().to_string_lossy().to_string(),
+                                action_type: "playbook_run".to_string(),
+                                target: name.clone(),
+                                group: group.map(|s| s.to_string()),
+                                status: "completed".to_string(),
+                                details: None,
+                            };
+                            self.record_action(&action_record)?;
+                        }
+                        Err(e) => {
+                            error!("Failed to run playbook {}: {}", name, e);
+                            
+                            // Record action failure
+                            let action_record = ActionRecord {
+                                timestamp: Utc::now(),
+                                hostname: gethostname::gethostname().to_string_lossy().to_string(),
+                                action_type: "playbook_run".to_string(),
+                                target: name.clone(),
+                                group: group.map(|s| s.to_string()),
+                                status: "failed".to_string(),
+                                details: Some(e.to_string()),
+                            };
+                            self.record_action(&action_record)?;
+                            
+                            return Err(e.into());
+                        }
+                    }
+                }
             }
         }
 
@@ -1474,6 +1554,22 @@ impl PackageManager {
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(LaszooError::Other(format!("Command failed: {}", stderr)))
         }
+    }
+    
+    /// Run a playbook using the PlaybookManager
+    async fn run_playbook(&self, name: &str, args: &[String]) -> Result<()> {
+        use crate::config::Config;
+        use crate::playbook::PlaybookManager;
+        
+        // Load config to get mount point
+        let config = Config::load(None)?;
+        let playbook_manager = PlaybookManager::new(&config)
+            .map_err(|e| LaszooError::Other(e.to_string()))?;
+        
+        // For now, we'll run playbooks locally
+        // In the future, we might parse args to determine if remote execution is needed
+        playbook_manager.run_playbook(name, None, args.to_vec())
+            .map_err(|e| LaszooError::Other(e.to_string()))
     }
 }
 

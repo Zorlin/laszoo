@@ -12,6 +12,8 @@ mod package;
 mod action;
 mod service;
 mod webui;
+mod playbook;
+mod inventory;
 
 use clap::Parser;
 use tracing::{info, error, debug, warn};
@@ -28,7 +30,7 @@ enum PackageStatus {
 }
 
 use crate::{
-    cli::{Cli, Commands, GroupCommands, GroupsCommands, SyncAction},
+    cli::{Cli, Commands, GroupCommands, GroupsCommands, SyncAction, PlaybookCommands},
     config::Config,
     error::{Result, LaszooError},
 };
@@ -87,6 +89,9 @@ fn requires_root(command: &Commands) -> bool {
             GroupCommands::List => false,
             GroupCommands::Rename { .. } => true,
         },
+        
+        // Playbook commands don't require root
+        Playbook { .. } => false,
     }
 }
 
@@ -200,6 +205,9 @@ async fn main() -> Result<()> {
         }
         Commands::Diff { group, file, unified, context } => {
             show_diff(&config, group.as_deref(), file.as_deref(), unified, context).await?;
+        }
+        Commands::Playbook { command } => {
+            handle_playbook_command(&config, command).await?;
         }
     }
 
@@ -858,7 +866,7 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
     let pkg_manager = crate::package::PackageManager::new(config.mfs_mount.clone());
     
     // Collect commands across all groups
-    let mut all_commands: Vec<(String, &str, PackageStatus)> = Vec::new();
+    let mut all_commands: Vec<(String, String, PackageStatus)> = Vec::new();
     
     for group_name in &machine_groups {
         println!("\n  [{}]", group_name);
@@ -904,7 +912,7 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                             package_statuses.push((format!("!{}", name), display_status));
                         }
                         crate::package::PackageOperation::UpdateAll { .. } => {
-                            all_commands.push((group_name.clone(), "++update", PackageStatus::UpToDate)); // TODO: Track actual status
+                            all_commands.push((group_name.clone(), "++update".to_string(), PackageStatus::UpToDate)); // TODO: Track actual status
                         }
                         crate::package::PackageOperation::UpgradeAll { .. } => {
                             // Check if system has pending updates
@@ -922,7 +930,7 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                             } else {
                                 PackageStatus::UpToDate
                             };
-                            all_commands.push((group_name.clone(), "++upgrade", status));
+                            all_commands.push((group_name.clone(), "++upgrade".to_string(), status));
                         }
                         crate::package::PackageOperation::DistUpgradeAll { .. } => {
                             // Check if system has pending updates (same logic as upgrade)
@@ -940,7 +948,7 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                             } else {
                                 PackageStatus::UpToDate
                             };
-                            all_commands.push((group_name.clone(), "++dist-upgrade", status));
+                            all_commands.push((group_name.clone(), "++dist-upgrade".to_string(), status));
                         }
                         crate::package::PackageOperation::FullUpgradeAll { .. } => {
                             // Check if system has pending updates (same logic as upgrade)
@@ -958,7 +966,12 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                             } else {
                                 PackageStatus::UpToDate
                             };
-                            all_commands.push((group_name.clone(), "++full-upgrade", status));
+                            all_commands.push((group_name.clone(), "++full-upgrade".to_string(), status));
+                        }
+                        crate::package::PackageOperation::RunPlaybook { name, .. } => {
+                            // RunPlaybook operations in status display
+                            let playbook_cmd = format!("++playbook {}", name);
+                            all_commands.push((group_name.clone(), playbook_cmd, PackageStatus::UpToDate));
                         }
                     }
                 }
@@ -1043,7 +1056,7 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                     print!("    {} {}", status_char, display_name);
                     
                     // Add history information if available
-                    if let Some((added_at, executed_at)) = history_map.get(*cmd_name) {
+                    if let Some((added_at, executed_at)) = history_map.get(cmd_name) {
                         if let Some(added) = added_at {
                             print!(" (added: {})", added.format("%Y-%m-%d %H:%M"));
                         }
@@ -1289,6 +1302,11 @@ async fn handle_group_command(group_name: &str, command: GroupCommands) -> Resul
 
             println!("Successfully added machine '{}' to group '{}'", machine_name, group_name);
             
+            // Sync inventory to reflect the new group membership
+            if let Err(e) = sync_inventory_for_groups(&config).await {
+                warn!("Failed to sync inventory after adding machine to group: {}", e);
+            }
+            
             // Check if we're adding the current machine and if there are pending upgrades
             let current_hostname = gethostname::gethostname().to_string_lossy().to_string();
             if machine_name == current_hostname {
@@ -1353,6 +1371,11 @@ async fn handle_group_command(group_name: &str, command: GroupCommands) -> Resul
 
             // Update machine's groups.conf
             update_machine_groups(&config.mfs_mount, &machine_name, group_name, false)?;
+            
+            // Sync inventory to reflect the removed group membership
+            if let Err(e) = sync_inventory_for_groups(&config).await {
+                warn!("Failed to sync inventory after removing machine from group: {}", e);
+            }
 
             // Check if this was the last member of the group
             if !keep {
@@ -2792,6 +2815,24 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
                     
                     last_packages_scan = std::time::Instant::now();
                 }
+                
+                // Periodic inventory sync (every 30 seconds)
+                static mut LAST_INVENTORY_SYNC: Option<std::time::Instant> = None;
+                unsafe {
+                    if LAST_INVENTORY_SYNC.is_none() {
+                        LAST_INVENTORY_SYNC = Some(std::time::Instant::now());
+                    }
+                    
+                    if let Some(last_sync) = LAST_INVENTORY_SYNC {
+                        if last_sync.elapsed() > Duration::from_secs(30) {
+                            debug!("Performing periodic inventory sync...");
+                            if let Err(e) = sync_inventory_for_groups(&config).await {
+                                warn!("Failed to sync inventory: {}", e);
+                            }
+                            LAST_INVENTORY_SYNC = Some(std::time::Instant::now());
+                        }
+                    }
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 error!("Watcher channel disconnected");
@@ -3767,6 +3808,80 @@ async fn show_diff(config: &Config, group: Option<&str>, file: Option<&Path>, un
     
     if !has_differences {
         println!("All files are synchronized with their templates");
+    }
+    
+    Ok(())
+}
+
+/// Sync inventory for Jetpack
+async fn sync_inventory_for_groups(config: &Config) -> Result<()> {
+    use crate::inventory::InventoryGenerator;
+    use crate::error::LaszooError;
+    
+    let inventory_gen = InventoryGenerator::new(config)
+        .map_err(|e| LaszooError::Other(e.to_string()))?;
+    inventory_gen.sync_from_laszoo_groups(config)
+        .map_err(|e| LaszooError::Other(e.to_string()))?;
+    
+    Ok(())
+}
+
+/// Handle playbook subcommands
+async fn handle_playbook_command(config: &Config, command: PlaybookCommands) -> Result<()> {
+    use crate::playbook::PlaybookManager;
+    use crate::inventory::InventoryGenerator;
+    use crate::error::LaszooError;
+    
+    let playbook_manager = PlaybookManager::new(config)
+        .map_err(|e| LaszooError::Other(e.to_string()))?;
+    
+    match command {
+        PlaybookCommands::Add { path, name, path_override } => {
+            let playbook_name = playbook_manager.add_playbook(&path, name, path_override)
+                .map_err(|e| LaszooError::Other(e.to_string()))?;
+            println!("Successfully added playbook: {}", playbook_name);
+            
+            // Sync inventory after adding playbook
+            let inventory_gen = InventoryGenerator::new(config)
+                .map_err(|e| LaszooError::Other(e.to_string()))?;
+            inventory_gen.sync_from_laszoo_groups(config)
+                .map_err(|e| LaszooError::Other(e.to_string()))?;
+        }
+        PlaybookCommands::List => {
+            let playbooks = playbook_manager.list_playbooks()
+                .map_err(|e| LaszooError::Other(e.to_string()))?;
+            
+            if playbooks.is_empty() {
+                println!("No playbooks found");
+            } else {
+                println!("Available playbooks:");
+                for (name, entry) in playbooks {
+                    println!("  {} - {:?}", name, entry.path);
+                    if let Some(desc) = &entry.description {
+                        println!("    Description: {}", desc);
+                    }
+                    println!("    Added by: {} at {}", entry.added_by, entry.added_at.format("%Y-%m-%d %H:%M:%S"));
+                    if let Some(last_run) = &entry.last_run {
+                        println!("    Last run: {} (run count: {})", last_run.format("%Y-%m-%d %H:%M:%S"), entry.run_count);
+                    }
+                }
+            }
+        }
+        PlaybookCommands::Run { name, inventory, args } => {
+            // Ensure inventory is synced before running
+            let inventory_gen = InventoryGenerator::new(config)
+                .map_err(|e| LaszooError::Other(e.to_string()))?;
+            inventory_gen.sync_from_laszoo_groups(config)
+                .map_err(|e| LaszooError::Other(e.to_string()))?;
+            
+            playbook_manager.run_playbook(&name, inventory, args)
+                .map_err(|e| LaszooError::Other(e.to_string()))?;
+        }
+        PlaybookCommands::Remove { name } => {
+            playbook_manager.remove_playbook(&name)
+                .map_err(|e| LaszooError::Other(e.to_string()))?;
+            println!("Successfully removed playbook: {}", name);
+        }
     }
     
     Ok(())

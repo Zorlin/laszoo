@@ -74,6 +74,12 @@ askama_axum = "0.4"
 # Static file serving
 mime_guess = "2.0"
 
+# Jetpack integration for automation
+jetpack = { path = "../jetpack" }
+
+# Privilege escalation
+sudo = "0.6"
+
 [features]
 default = ["gamepad"]
 gamepad = ["dep:gilrs"]

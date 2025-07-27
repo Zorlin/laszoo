@@ -1,0 +1,106 @@
+# Safe System Update Playbook for Laszoo + Jetpack
+# Performs system updates with safety checks
+
+- name: Safe system update
+  groups:
+    - all
+  
+  sudo: root
+  serial: 1  # One host at a time
+  
+  defaults:
+    service_name: "{{ primary_service | default('nginx') }}"
+    health_endpoint: "{{ health_url | default('http://localhost/health') }}"
+    
+  tasks:
+    - !facts
+    
+    # Pre-update health check
+    - !shell
+      name: Check service health before update
+      cmd: "curl -f {{ health_endpoint }}"
+      save: pre_health
+      ignore_errors: true
+    
+    - !assert
+      name: Service must be healthy before update
+      msg: "Service is not healthy, aborting update"
+      true: (eq pre_health.rc 0)
+    
+    # Create Laszoo checkpoint
+    - !shell
+      name: Create pre-update checkpoint
+      cmd: "laszoo commit -m 'Pre-update checkpoint on {{ jet_hostname }}'"
+    
+    # Perform system update based on OS
+    - !apt
+      name: Update all packages (Debian/Ubuntu)
+      package: "*"
+      state: latest
+      update_cache: true
+      with:
+        condition: (eq jet_os_flavor "Debian")
+    
+    - !dnf
+      name: Update all packages (RHEL/CentOS)
+      package: "*"
+      state: latest
+      with:
+        condition: (eq jet_os_flavor "EL")
+    
+    # Check if reboot is required
+    - !stat
+      path: /var/run/reboot-required
+      save: reboot_file
+      with:
+        condition: (eq jet_os_flavor "Debian")
+    
+    - !shell
+      name: Check if kernel was updated
+      cmd: "needs-restarting -r"
+      save: needs_restart
+      ignore_errors: true
+      with:
+        condition: (eq jet_os_flavor "EL")
+    
+    # Reboot if required
+    - !shell
+      name: Reboot system
+      cmd: "shutdown -r +1 'System reboot required after update'"
+      with:
+        condition: (or 
+          (and (eq jet_os_flavor "Debian") (exists reboot_file.exists))
+          (and (eq jet_os_flavor "EL") (ne needs_restart.rc 0))
+        )
+    
+    # Wait for system to come back (if rebooted)
+    - !shell
+      name: Wait for reboot to complete
+      cmd: "sleep 90"
+      with:
+        condition: (or 
+          (and (eq jet_os_flavor "Debian") (exists reboot_file.exists))
+          (and (eq jet_os_flavor "EL") (ne needs_restart.rc 0))
+        )
+    
+    # Verify services are running
+    - !sd_service
+      name: "{{ service_name }}"
+      state: started
+    
+    # Post-update health check
+    - !shell
+      name: Check service health after update
+      cmd: "curl -f {{ health_endpoint }}"
+      save: post_health
+      with:
+        retry: 5
+        retry_delay: 10
+    
+    - !assert
+      name: Service must be healthy after update
+      msg: "Service is not healthy after update!"
+      true: (eq post_health.rc 0)
+    
+    - !echo
+      msg: "System update completed successfully on {{ jet_hostname }}"

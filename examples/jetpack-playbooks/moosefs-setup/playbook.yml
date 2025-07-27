@@ -1,0 +1,141 @@
+# MooseFS Setup Playbook for Laszoo + Jetpack
+# Sets up MooseFS master and chunkservers
+
+- name: Setup MooseFS cluster
+  groups:
+    - moosefs
+  
+  sudo: root
+  
+  defaults:
+    mfs_master_host: "{{ master_host | default('mfsmaster') }}"
+    mfs_version: "3.0.116"
+    
+  tasks:
+    - !facts
+    
+    # Install MooseFS packages
+    - !apt
+      name: Configure MooseFS repository (Debian/Ubuntu)
+      package: 
+        - wget
+        - gnupg
+      with:
+        condition: (eq jet_os_flavor "Debian")
+    
+    - !shell
+      name: Add MooseFS repository key
+      cmd: "wget -O - https://ppa.moosefs.com/moosefs.key | apt-key add -"
+      with:
+        condition: (eq jet_os_flavor "Debian")
+    
+    - !shell
+      name: Add MooseFS repository
+      cmd: "echo 'deb https://ppa.moosefs.com/stable/apt/ubuntu/$(lsb_release -cs) $(lsb_release -cs) main' > /etc/apt/sources.list.d/moosefs.list"
+      with:
+        condition: (eq jet_os_flavor "Debian")
+    
+    - !shell
+      name: Update apt cache
+      cmd: "apt-get update"
+      with:
+        condition: (eq jet_os_flavor "Debian")
+    
+    # Install packages based on role
+    - !apt
+      package: moosefs-master
+      with:
+        condition: (and (eq jet_os_flavor "Debian") (in "masters" jet_groups))
+    
+    - !apt
+      package: moosefs-chunkserver
+      with:
+        condition: (and (eq jet_os_flavor "Debian") (in "chunkservers" jet_groups))
+    
+    - !apt
+      package: moosefs-client
+      with:
+        condition: (eq jet_os_flavor "Debian")
+    
+    # Configure master
+    - !file
+      path: /etc/mfs/mfsmaster.cfg
+      content: |
+        # MooseFS Master Configuration
+        DATA_PATH = /var/lib/mfs
+        EXPORTS_FILENAME = /etc/mfs/mfsexports.cfg
+        TOPOLOGY_FILENAME = /etc/mfs/mfstopology.cfg
+        LICENCE_FILENAME = /etc/mfs/mfslicence.txt
+        MASTER_HOST = {{ mfs_master_host }}
+      with:
+        condition: (in "masters" jet_groups)
+    
+    # Configure chunkserver
+    - !file
+      path: /etc/mfs/mfschunkserver.cfg
+      content: |
+        # MooseFS Chunkserver Configuration
+        DATA_PATH = /var/lib/mfs
+        MASTER_HOST = {{ mfs_master_host }}
+        MASTER_PORT = 9420
+        HDD_CONF_FILENAME = /etc/mfs/mfshdd.cfg
+      with:
+        condition: (in "chunkservers" jet_groups)
+    
+    # Configure storage paths for chunkservers
+    - !file
+      path: /etc/mfs/mfshdd.cfg
+      content: |
+        # MooseFS HDD Configuration
+        /mnt/mfschunks1
+        /mnt/mfschunks2
+      with:
+        condition: (in "chunkservers" jet_groups)
+    
+    # Create chunk directories
+    - !directory
+      path: /mnt/mfschunks1
+      owner: mfs
+      group: mfs
+      mode: "0755"
+      with:
+        condition: (in "chunkservers" jet_groups)
+    
+    - !directory
+      path: /mnt/mfschunks2
+      owner: mfs
+      group: mfs
+      mode: "0755"
+      with:
+        condition: (in "chunkservers" jet_groups)
+    
+    # Start services
+    - !sd_service
+      name: moosefs-master
+      state: started
+      enabled: true
+      with:
+        condition: (in "masters" jet_groups)
+    
+    - !sd_service
+      name: moosefs-chunkserver
+      state: started
+      enabled: true
+      with:
+        condition: (in "chunkservers" jet_groups)
+    
+    # Mount MooseFS on all nodes
+    - !directory
+      path: /mnt/laszoo
+      mode: "0755"
+    
+    - !shell
+      name: Mount MooseFS
+      cmd: "mfsmount /mnt/laszoo -H {{ mfs_master_host }}"
+      save: mount_result
+      ignore_errors: true
+    
+    - !assert
+      name: Verify MooseFS mount
+      msg: "MooseFS mount failed"
+      true: (eq mount_result.rc 0)

@@ -15,10 +15,17 @@
       "Bash(dpkg:*)",
       "Bash(sudo systemctl stop:*)",
       "Bash(sudo RUST_LOG=debug laszoo watch -a --hard)",
-      "Bash(RUST_LOG=debug ./target/release/laszoo apply desktop)"
+      "Bash(RUST_LOG=debug ./target/release/laszoo apply desktop)",
+      "mcp__deepwiki__read_wiki_contents",
+      "mcp__deepwiki__read_wiki_structure",
+      "mcp__deepwiki__ask_question",
+      "Bash(bash:*)",
+      "Bash(sudo mkdir:*)",
+      "Bash(sudo chmod:*)"
     ],
     "deny": []
   },
+  "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "plane",
     "playwright",
