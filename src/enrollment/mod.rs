@@ -25,6 +25,12 @@ pub struct EnrollmentEntry {
 pub struct EnrollmentManifest {
     pub version: String,
     pub entries: HashMap<PathBuf, EnrollmentEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_trigger: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_trigger: Option<String>,
 }
 
 impl EnrollmentManifest {
@@ -32,6 +38,9 @@ impl EnrollmentManifest {
         Self {
             version: "1.0".to_string(),
             entries: HashMap::new(),
+            sync_action: None,
+            before_trigger: None,
+            after_trigger: None,
         }
     }
 

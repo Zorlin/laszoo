@@ -15,6 +15,10 @@ pub enum PackageOperation {
     UpdateAll { start_action: Option<String>, end_action: Option<String> },
     /// ++upgrade - Upgrade all packages with before/after actions
     UpgradeAll { start_action: Option<String>, end_action: Option<String> },
+    /// ++dist-upgrade - Distribution upgrade with before/after actions
+    DistUpgradeAll { start_action: Option<String>, end_action: Option<String> },
+    /// ++full-upgrade - Full upgrade with before/after actions (same as dist-upgrade)
+    FullUpgradeAll { start_action: Option<String>, end_action: Option<String> },
     /// +package - Install package
     Install { name: String },
     /// =package - Keep package (don't auto-install/remove)
@@ -96,7 +100,8 @@ impl PackageManager {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if let Ok(action) = serde_json::from_str::<ActionRecord>(&content) {
                         if action.group.as_ref() == Some(&group.to_string()) {
-                            if action.target == "++update" || action.target == "++upgrade" {
+                            if action.target == "++update" || action.target == "++upgrade" || 
+                               action.target == "++dist-upgrade" || action.target == "++full-upgrade" {
                                 let entry = command_history.entry(action.target.clone()).or_insert((None, None));
                                 
                                 // Track first seen (added) and last executed
@@ -205,7 +210,7 @@ impl PackageManager {
         }
         
         // Handle upgrade all: ++upgrade or ++upgrade --before cmd --after cmd
-        if line.starts_with("++upgrade") {
+        if line.starts_with("++upgrade") && !line.starts_with("++upgrade-") {
             let mut start_action = None;
             let mut end_action = None;
             
@@ -239,6 +244,80 @@ impl PackageManager {
             }
             
             return Ok(Some(PackageOperation::UpgradeAll { start_action, end_action }));
+        }
+        
+        // Handle dist-upgrade: ++dist-upgrade or ++dist-upgrade --before cmd --after cmd
+        if line.starts_with("++dist-upgrade") {
+            let mut start_action = None;
+            let mut end_action = None;
+            
+            // Parse --before and --after flags
+            if line.contains("--before") || line.contains("--after") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                let mut i = 0;
+                while i < parts.len() {
+                    if parts[i] == "--before" && i + 1 < parts.len() {
+                        // Collect all parts until next flag or end
+                        let mut cmd_parts = vec![];
+                        i += 1;
+                        while i < parts.len() && !parts[i].starts_with("--") {
+                            cmd_parts.push(parts[i]);
+                            i += 1;
+                        }
+                        start_action = Some(cmd_parts.join(" "));
+                    } else if parts[i] == "--after" && i + 1 < parts.len() {
+                        // Collect all parts until next flag or end
+                        let mut cmd_parts = vec![];
+                        i += 1;
+                        while i < parts.len() && !parts[i].starts_with("--") {
+                            cmd_parts.push(parts[i]);
+                            i += 1;
+                        }
+                        end_action = Some(cmd_parts.join(" "));
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            
+            return Ok(Some(PackageOperation::DistUpgradeAll { start_action, end_action }));
+        }
+        
+        // Handle full-upgrade: ++full-upgrade or ++full-upgrade --before cmd --after cmd
+        if line.starts_with("++full-upgrade") {
+            let mut start_action = None;
+            let mut end_action = None;
+            
+            // Parse --before and --after flags
+            if line.contains("--before") || line.contains("--after") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                let mut i = 0;
+                while i < parts.len() {
+                    if parts[i] == "--before" && i + 1 < parts.len() {
+                        // Collect all parts until next flag or end
+                        let mut cmd_parts = vec![];
+                        i += 1;
+                        while i < parts.len() && !parts[i].starts_with("--") {
+                            cmd_parts.push(parts[i]);
+                            i += 1;
+                        }
+                        start_action = Some(cmd_parts.join(" "));
+                    } else if parts[i] == "--after" && i + 1 < parts.len() {
+                        // Collect all parts until next flag or end
+                        let mut cmd_parts = vec![];
+                        i += 1;
+                        while i < parts.len() && !parts[i].starts_with("--") {
+                            cmd_parts.push(parts[i]);
+                            i += 1;
+                        }
+                        end_action = Some(cmd_parts.join(" "));
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            
+            return Ok(Some(PackageOperation::FullUpgradeAll { start_action, end_action }));
         }
         
         // Handle upgrade with post-action: ^nginx --upgrade=systemctl restart nginx
@@ -294,8 +373,10 @@ impl PackageManager {
             for op in group_ops {
                 match &op {
                     PackageOperation::UpdateAll { .. } |
-                    PackageOperation::UpgradeAll { .. } => {
-                        // UpdateAll and UpgradeAll are special operations that don't have a package name
+                    PackageOperation::UpgradeAll { .. } |
+                    PackageOperation::DistUpgradeAll { .. } |
+                    PackageOperation::FullUpgradeAll { .. } => {
+                        // These are special operations that don't have a package name
                         operations.push(op);
                     }
                     _ => {
@@ -307,6 +388,8 @@ impl PackageManager {
                             PackageOperation::Purge { name } => name,
                             PackageOperation::UpdateAll { .. } => unreachable!(),
                             PackageOperation::UpgradeAll { .. } => unreachable!(),
+                            PackageOperation::DistUpgradeAll { .. } => unreachable!(),
+                            PackageOperation::FullUpgradeAll { .. } => unreachable!(),
                         };
                         operation_map.insert(name.clone(), op);
                     }
@@ -326,8 +409,10 @@ impl PackageManager {
                 for op in machine_ops {
                     match &op {
                         PackageOperation::UpdateAll { .. } |
-                        PackageOperation::UpgradeAll { .. } => {
-                            // UpdateAll and UpgradeAll are special operations that don't have a package name
+                        PackageOperation::UpgradeAll { .. } |
+                        PackageOperation::DistUpgradeAll { .. } |
+                        PackageOperation::FullUpgradeAll { .. } => {
+                            // These are special operations that don't have a package name
                             operations.push(op);
                         }
                         _ => {
@@ -339,6 +424,8 @@ impl PackageManager {
                                 PackageOperation::Purge { name } => name,
                                 PackageOperation::UpdateAll { .. } => unreachable!(),
                                 PackageOperation::UpgradeAll { .. } => unreachable!(),
+                                PackageOperation::DistUpgradeAll { .. } => unreachable!(),
+                                PackageOperation::FullUpgradeAll { .. } => unreachable!(),
                             };
                             operation_map.insert(name.clone(), op);
                         }
@@ -379,6 +466,8 @@ impl PackageManager {
                 PackageOperation::Purge { name } => Some(name.clone()),
                 PackageOperation::UpdateAll { .. } => None, // UpdateAll doesn't have a package name
                 PackageOperation::UpgradeAll { .. } => None, // UpgradeAll doesn't have a package name
+                PackageOperation::DistUpgradeAll { .. } => None, // DistUpgradeAll doesn't have a package name
+                PackageOperation::FullUpgradeAll { .. } => None, // FullUpgradeAll doesn't have a package name
             }
         }).collect();
 
@@ -411,8 +500,14 @@ impl PackageManager {
         content.push_str("# Syntax:\n");
         content.push_str("# ^package - Upgrade package\n");
         content.push_str("# ^package --upgrade=command - Upgrade with post-action\n");
+        content.push_str("# ++update - Update package lists\n");
+        content.push_str("# ++update --before cmd --after cmd - Update with before/after actions\n");
         content.push_str("# ++upgrade - Upgrade all packages\n");
-        content.push_str("# ++upgrade --start cmd --end cmd - Upgrade all with start/end actions\n");
+        content.push_str("# ++upgrade --before cmd --after cmd - Upgrade all with before/after actions\n");
+        content.push_str("# ++dist-upgrade - Distribution upgrade all packages\n");
+        content.push_str("# ++dist-upgrade --before cmd --after cmd - Dist-upgrade with before/after actions\n");
+        content.push_str("# ++full-upgrade - Full upgrade all packages (Proxmox safe)\n");
+        content.push_str("# ++full-upgrade --before cmd --after cmd - Full-upgrade with before/after actions\n");
         content.push_str("# +package - Install package\n");
         content.push_str("# =package - Keep package (don't auto-install/remove)\n");
         content.push_str("# !package - Remove package\n");
@@ -440,6 +535,26 @@ impl PackageManager {
                 }
                 PackageOperation::UpgradeAll { start_action, end_action } => {
                     let mut line = String::from("++upgrade");
+                    if let Some(start) = start_action {
+                        line.push_str(&format!(" --before {}", start));
+                    }
+                    if let Some(end) = end_action {
+                        line.push_str(&format!(" --after {}", end));
+                    }
+                    content.push_str(&format!("{}\n", line));
+                }
+                PackageOperation::DistUpgradeAll { start_action, end_action } => {
+                    let mut line = String::from("++dist-upgrade");
+                    if let Some(start) = start_action {
+                        line.push_str(&format!(" --before {}", start));
+                    }
+                    if let Some(end) = end_action {
+                        line.push_str(&format!(" --after {}", end));
+                    }
+                    content.push_str(&format!("{}\n", line));
+                }
+                PackageOperation::FullUpgradeAll { start_action, end_action } => {
+                    let mut line = String::from("++full-upgrade");
                     if let Some(start) = start_action {
                         line.push_str(&format!(" --before {}", start));
                     }
@@ -550,6 +665,12 @@ impl PackageManager {
                     }
                 }
                 PackageOperation::UpgradeAll { start_action, end_action } => {
+                    // Check if there are actually updates available
+                    if !self.has_system_updates(&pkg_mgr).await? {
+                        info!("No system updates available, skipping ++upgrade");
+                        continue;
+                    }
+                    
                     // Record action start
                     let action_record = ActionRecord {
                         timestamp: Utc::now(),
@@ -600,6 +721,137 @@ impl PackageManager {
                     
                     if let Some(action) = end_action {
                         info!("Running post-upgrade action: {}", action);
+                        self.run_command(action).await?;
+                    }
+                }
+                PackageOperation::DistUpgradeAll { start_action, end_action } => {
+                    // Check if there are actually updates available
+                    if !self.has_system_updates(&pkg_mgr).await? {
+                        info!("No system updates available, skipping ++dist-upgrade");
+                        continue;
+                    }
+                    
+                    // Record action start
+                    let action_record = ActionRecord {
+                        timestamp: Utc::now(),
+                        hostname: hostname.clone(),
+                        action_type: "package_dist_upgrade_all".to_string(),
+                        target: "++dist-upgrade".to_string(),
+                        group: group.map(|s| s.to_string()),
+                        status: "started".to_string(),
+                        details: None,
+                    };
+                    let _ = self.record_action(&action_record);
+                    
+                    if let Some(action) = start_action {
+                        info!("Running pre-dist-upgrade action: {}", action);
+                        self.run_command(action).await?;
+                    }
+                    
+                    info!("Running distribution upgrade");
+                    match self.system_dist_upgrade(&pkg_mgr).await {
+                        Ok(_) => {
+                            // Record success
+                            let action_record = ActionRecord {
+                                timestamp: Utc::now(),
+                                hostname: hostname.clone(),
+                                action_type: "package_dist_upgrade_all".to_string(),
+                                target: "++dist-upgrade".to_string(),
+                                group: group.map(|s| s.to_string()),
+                                status: "completed".to_string(),
+                                details: None,
+                            };
+                            let _ = self.record_action(&action_record);
+                        }
+                        Err(e) => {
+                            // Record failure
+                            let action_record = ActionRecord {
+                                timestamp: Utc::now(),
+                                hostname: hostname.clone(),
+                                action_type: "package_dist_upgrade_all".to_string(),
+                                target: "++dist-upgrade".to_string(),
+                                group: group.map(|s| s.to_string()),
+                                status: "failed".to_string(),
+                                details: Some(format!("Error: {}", e)),
+                            };
+                            let _ = self.record_action(&action_record);
+                            return Err(e);
+                        }
+                    }
+                    
+                    if let Some(action) = end_action {
+                        info!("Running post-dist-upgrade action: {}", action);
+                        self.run_command(action).await?;
+                    }
+                }
+                PackageOperation::FullUpgradeAll { start_action, end_action } => {
+                    // Record action start
+                    let action_record = ActionRecord {
+                        timestamp: Utc::now(),
+                        hostname: hostname.clone(),
+                        action_type: "package_full_upgrade_all".to_string(),
+                        target: "++full-upgrade".to_string(),
+                        group: group.map(|s| s.to_string()),
+                        status: "started".to_string(),
+                        details: None,
+                    };
+                    let _ = self.record_action(&action_record);
+                    
+                    // Check if there are actually updates available
+                    if !self.has_system_updates(&pkg_mgr).await? {
+                        info!("No system updates available, skipping ++full-upgrade");
+                        // Record completion even when no updates
+                        let action_record = ActionRecord {
+                            timestamp: Utc::now(),
+                            hostname: hostname.clone(),
+                            action_type: "package_full_upgrade_all".to_string(),
+                            target: "++full-upgrade".to_string(),
+                            group: group.map(|s| s.to_string()),
+                            status: "completed".to_string(),
+                            details: Some("No updates available".to_string()),
+                        };
+                        let _ = self.record_action(&action_record);
+                        continue;
+                    }
+                    
+                    if let Some(action) = start_action {
+                        info!("Running pre-full-upgrade action: {}", action);
+                        self.run_command(action).await?;
+                    }
+                    
+                    info!("Running full upgrade");
+                    match self.system_full_upgrade(&pkg_mgr).await {
+                        Ok(_) => {
+                            // Record success
+                            let action_record = ActionRecord {
+                                timestamp: Utc::now(),
+                                hostname: hostname.clone(),
+                                action_type: "package_full_upgrade_all".to_string(),
+                                target: "++full-upgrade".to_string(),
+                                group: group.map(|s| s.to_string()),
+                                status: "completed".to_string(),
+                                details: None,
+                            };
+                            let _ = self.record_action(&action_record);
+                        }
+                        Err(e) => {
+                            // Record failure
+                            let action_record = ActionRecord {
+                                timestamp: Utc::now(),
+                                hostname: hostname.clone(),
+                                action_type: "package_full_upgrade_all".to_string(),
+                                target: "++full-upgrade".to_string(),
+                                group: group.map(|s| s.to_string()),
+                                status: "failed".to_string(),
+                                details: Some(format!("Error: {}", e)),
+                            };
+                            let _ = self.record_action(&action_record);
+                            return Err(e);
+                        }
+                    }
+                    
+                    if let Some(action) = end_action {
+                        info!("Running post-full-upgrade action: {}", action);
                         self.run_command(action).await?;
                     }
                 }
@@ -709,6 +961,70 @@ impl PackageManager {
         self.run_command(cmd).await
     }
 
+    /// Run a distribution upgrade
+    pub async fn system_dist_upgrade(&self, pkg_mgr: &PackageManagerType) -> Result<()> {
+        let cmd = match pkg_mgr {
+            PackageManagerType::Apt => "apt-get dist-upgrade -y",
+            PackageManagerType::Yum => "yum upgrade -y", // yum doesn't have dist-upgrade
+            PackageManagerType::Dnf => "dnf distro-sync -y",
+            PackageManagerType::Pacman => "pacman -Syu --noconfirm",
+            PackageManagerType::Zypper => "zypper dist-upgrade -y",
+            PackageManagerType::Apk => "apk upgrade --available",
+        };
+
+        self.run_command(cmd).await
+    }
+
+    /// Run a full upgrade (same as dist-upgrade on most systems)
+    pub async fn system_full_upgrade(&self, pkg_mgr: &PackageManagerType) -> Result<()> {
+        let cmd = match pkg_mgr {
+            PackageManagerType::Apt => "apt-get full-upgrade -y",
+            PackageManagerType::Yum => "yum upgrade -y", // yum doesn't have full-upgrade
+            PackageManagerType::Dnf => "dnf distro-sync -y",
+            PackageManagerType::Pacman => "pacman -Syu --noconfirm",
+            PackageManagerType::Zypper => "zypper dist-upgrade -y",
+            PackageManagerType::Apk => "apk upgrade --available",
+        };
+
+        self.run_command(cmd).await
+    }
+
+    /// Check if system has updates available
+    async fn has_system_updates(&self, pkg_mgr: &PackageManagerType) -> Result<bool> {
+        use tokio::process::Command;
+        
+        let check_cmd = match pkg_mgr {
+            PackageManagerType::Apt => {
+                "apt list --upgradable 2>/dev/null | grep -q upgradable"
+            }
+            PackageManagerType::Yum => {
+                "yum check-update >/dev/null 2>&1; [ $? -eq 100 ]"
+            }
+            PackageManagerType::Dnf => {
+                "dnf check-update >/dev/null 2>&1; [ $? -eq 100 ]"
+            }
+            PackageManagerType::Pacman => {
+                "pacman -Qu >/dev/null 2>&1"
+            }
+            PackageManagerType::Zypper => {
+                "zypper list-updates | grep -q '^v |'"
+            }
+            PackageManagerType::Apk => {
+                "apk version -l '<' | grep -q '<'"
+            }
+        };
+        
+        match Command::new("sh")
+            .arg("-c")
+            .arg(check_cmd)
+            .status()
+            .await
+        {
+            Ok(status) => Ok(status.success()),
+            Err(_) => Ok(false), // If check fails, assume no updates
+        }
+    }
+    
     /// Run a shell command
     async fn run_command(&self, cmd: &str) -> Result<()> {
         use tokio::process::Command;

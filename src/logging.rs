@@ -4,13 +4,46 @@ use crate::config::LoggingConfig;
 use crate::error::Result;
 
 pub fn init_logging(config: &LoggingConfig, verbose: bool) -> Result<()> {
-    // Set up env filter with the configured level or RUST_LOG env var
+    // Load environment variables from /etc/default/laszoo if it exists
+    if let Ok(content) = std::fs::read_to_string("/etc/default/laszoo") {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            
+            if let Some((key, value)) = line.split_once('=') {
+                let key = key.trim();
+                let value = value.trim().trim_matches('"');
+                
+                // Only set if not already set in environment
+                if std::env::var(key).is_err() {
+                    std::env::set_var(key, value);
+                }
+            }
+        }
+    }
+    
+    // Set up env filter with the configured level or RUST_LOG/LASZOO_LOG_LEVEL env var
     let env_filter = if verbose {
         EnvFilter::from_default_env()
             .add_directive("laszoo=debug".parse().unwrap())
     } else {
-        match std::env::var("RUST_LOG") {
-            Ok(_) => EnvFilter::from_default_env(),
+        // Check LASZOO_LOG_LEVEL first, then RUST_LOG
+        let log_level = std::env::var("LASZOO_LOG_LEVEL")
+            .or_else(|_| std::env::var("RUST_LOG"));
+            
+        match log_level {
+            Ok(level) => {
+                // If it's a simple level like "debug", convert to "laszoo=debug"
+                if matches!(level.as_str(), "trace" | "debug" | "info" | "warn" | "error") {
+                    EnvFilter::from_default_env()
+                        .add_directive(format!("laszoo={}", level).parse().unwrap())
+                } else {
+                    // Otherwise assume it's a full RUST_LOG style filter
+                    EnvFilter::try_new(&level).unwrap_or_else(|_| EnvFilter::from_default_env())
+                }
+            },
             Err(_) => {
                 let level = match config.level.as_str() {
                     "trace" => Level::TRACE,

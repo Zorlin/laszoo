@@ -182,6 +182,14 @@ pub enum Commands {
         /// Apply patches in a rolling fashion (one machine at a time)
         #[arg(long)]
         rolling: bool,
+        
+        /// Use full-upgrade instead of upgrade (for Proxmox/Debian)
+        #[arg(long)]
+        full_upgrade: bool,
+        
+        /// Use dist-upgrade instead of upgrade (for Proxmox/Debian)
+        #[arg(long)]
+        dist_upgrade: bool,
     },
     
     /// Manage Laszoo as a system service

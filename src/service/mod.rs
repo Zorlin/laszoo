@@ -115,6 +115,10 @@ LASZOO_EXTRA_ARGS=""
 
 # Mount point for MooseFS/CephFS
 LASZOO_MOUNT="/mnt/laszoo"
+
+# Log level: trace, debug, info, warn, error
+# LASZOO_LOG_LEVEL="info"
+LASZOO_LOG_LEVEL=""
 "#,
             user,
             if hard { "true" } else { "false" }

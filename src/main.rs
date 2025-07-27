@@ -46,6 +46,9 @@ async fn main() -> Result<()> {
     // Log startup info
     info!("Starting Laszoo v{}", env!("CARGO_PKG_VERSION"));
 
+    // Check Ollama availability for AI commit messages
+    check_ollama_availability(&config).await;
+
     match cli.command {
         Commands::Init { mfs_mount } => {
             init_laszoo(&config, &mfs_mount).await?;
@@ -82,8 +85,8 @@ async fn main() -> Result<()> {
         Commands::Install { group, packages, after } => {
             install_packages(&config, &group, packages, after.as_deref()).await?;
         }
-        Commands::Patch { group, before, after, rolling } => {
-            patch_group(&config, &group, before.as_deref(), after.as_deref(), rolling).await?;
+        Commands::Patch { group, before, after, rolling, full_upgrade, dist_upgrade } => {
+            patch_group(&config, &group, before.as_deref(), after.as_deref(), rolling, full_upgrade, dist_upgrade).await?;
         }
         Commands::Service { command } => {
             handle_service_command(command).await?;
@@ -97,6 +100,32 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+/// Check if Ollama is available for AI commit messages
+async fn check_ollama_availability(config: &Config) {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    
+    match client
+        .get(format!("{}/api/tags", config.ollama_endpoint))
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            info!("✅ Ollama available at {} - AI commit messages enabled", config.ollama_endpoint);
+        }
+        Ok(response) => {
+            warn!("⚠️  Ollama endpoint responded with status {} - falling back to template commit messages", response.status());
+        }
+        Err(e) => {
+            warn!("⚠️  Ollama unavailable at {} ({})", config.ollama_endpoint, e);
+            warn!("    Falling back to template-generated commit messages");
+        }
+    }
+}
+
 async fn init_laszoo(config: &Config, mfs_mount: &std::path::Path) -> Result<()> {
     info!("Initializing Laszoo with distributed filesystem at {:?}", mfs_mount);
 
@@ -188,9 +217,9 @@ async fn enroll_files(
         manager.enroll_path(group, None, force, machine, hybrid, before.clone(), after.clone())?;
         info!("Successfully enrolled machine into group '{}'", group);
 
-        // Store triggers and action for this group if provided
+        // Update manifest with sync action and triggers if provided
         if before.is_some() || after.is_some() || !matches!(action, crate::cli::SyncAction::Converge) {
-            store_group_config(&config.mfs_mount, group, before.as_deref(), after.as_deref(), &action)?;
+            update_manifest_config(&config.mfs_mount, group, before.as_deref(), after.as_deref(), &action)?;
         }
 
         return Ok(());
@@ -212,9 +241,9 @@ async fn enroll_files(
         }
     }
 
-    // Store triggers and action for this group if provided
+    // Update manifest with sync action and triggers if provided
     if enrolled_count > 0 && (before.is_some() || after.is_some() || !matches!(action, crate::cli::SyncAction::Converge)) {
-        store_group_config(&config.mfs_mount, group, before.as_deref(), after.as_deref(), &action)?;
+        update_manifest_config(&config.mfs_mount, group, before.as_deref(), after.as_deref(), &action)?;
     }
 
     info!("Enrollment complete: {} files enrolled, {} errors",
@@ -790,6 +819,42 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                             };
                             all_commands.push((group_name.clone(), "++upgrade", status));
                         }
+                        crate::package::PackageOperation::DistUpgradeAll { .. } => {
+                            // Check if system has pending updates (same logic as upgrade)
+                            let has_updates = check_system_updates(&system_pkg_mgr).await;
+                            let has_phased = if has_updates {
+                                check_phased_updates(&system_pkg_mgr).await
+                            } else {
+                                false
+                            };
+                            
+                            let status = if has_phased {
+                                PackageStatus::PhasedUpdates
+                            } else if has_updates {
+                                PackageStatus::PendingUpdates
+                            } else {
+                                PackageStatus::UpToDate
+                            };
+                            all_commands.push((group_name.clone(), "++dist-upgrade", status));
+                        }
+                        crate::package::PackageOperation::FullUpgradeAll { .. } => {
+                            // Check if system has pending updates (same logic as upgrade)
+                            let has_updates = check_system_updates(&system_pkg_mgr).await;
+                            let has_phased = if has_updates {
+                                check_phased_updates(&system_pkg_mgr).await
+                            } else {
+                                false
+                            };
+                            
+                            let status = if has_phased {
+                                PackageStatus::PhasedUpdates
+                            } else if has_updates {
+                                PackageStatus::PendingUpdates
+                            } else {
+                                PackageStatus::UpToDate
+                            };
+                            all_commands.push((group_name.clone(), "++full-upgrade", status));
+                        }
                     }
                 }
                 
@@ -868,7 +933,9 @@ async fn show_status(config: &Config, detailed: bool) -> Result<()> {
                         PackageStatus::Missing => "✗",
                     };
                     
-                    print!("    {} {}", status_char, cmd_name);
+                    // Strip ++ prefix for cleaner display
+                    let display_name = cmd_name.strip_prefix("++").unwrap_or(cmd_name);
+                    print!("    {} {}", status_char, display_name);
                     
                     // Add history information if available
                     if let Some((added_at, executed_at)) = history_map.get(*cmd_name) {
@@ -1792,7 +1859,7 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
     let mut last_event_time = std::time::Instant::now();
     let mut last_template_time = std::time::Instant::now();
     let mut last_template_scan = std::time::Instant::now();
-    let template_scan_interval = Duration::from_secs(2); // Scan every 2 seconds
+    let template_scan_interval = Duration::from_millis(500); // Scan every 500ms
     let mut known_templates: HashSet<PathBuf> = HashSet::new();
     let mut known_template_timestamps: std::collections::HashMap<PathBuf, std::time::SystemTime> = std::collections::HashMap::new();
     let mut known_template_checksums: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
@@ -1800,7 +1867,7 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
     // Track packages.conf files
     let mut packages_conf_checksums: HashMap<PathBuf, String> = HashMap::new();
     let mut last_packages_scan = std::time::Instant::now();
-    let packages_scan_interval = Duration::from_secs(2); // Check every 2 seconds
+    let packages_scan_interval = Duration::from_millis(500); // Check every 500ms
 
     // Initial scan of templates and packages.conf
     for group_name in &groups_to_watch {
@@ -1975,6 +2042,7 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
 
                     // Apply changes if auto mode is enabled or user confirms
                     let should_apply = if auto {
+                        debug!("Auto mode enabled - automatically applying changes");
                         true
                     } else {
                         print!("\nApply changes? [y/N] ");
@@ -1986,6 +2054,7 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
                         input.trim().to_lowercase() == "y"
                     };
 
+                    debug!("should_apply = {}, auto = {}", should_apply, auto);
                     if should_apply {
                         // Process changes for each affected group
                         for group_name in affected_groups {
@@ -1998,6 +2067,9 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
                             // Process each changed file in this group according to sync action
                             if let Some(files) = files_by_group.get(&group_name) {
                                 for path in files {
+                                    debug!("Processing file: {} (exists: {}, hard: {})", 
+                                        path.display(), path.exists(), hard);
+                                    
                                     match handle_file_change(
                                         &enrollment_manager,
                                         path,
@@ -2012,6 +2084,8 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
                                                 // Track that this template change originated from local file change
                                                 let template_path = enrollment_manager.get_group_template_path(&group_name, path)?;
                                                 local_template_changes.insert(template_path);
+                                            } else {
+                                                debug!("No template update needed/performed for {}", path.display());
                                             }
                                         }
                                         Err(e) => {
@@ -2300,6 +2374,46 @@ async fn watch_with_recovery(config: &Config, group: Option<&str>, auto: bool, h
                         println!(); // Add blank line for readability
                     }
                     
+                    // Even if packages.conf hasn't changed, check for unexecuted commands
+                    if auto && !packages_changed {
+                        debug!("Checking for unexecuted package commands...");
+                        for group_name in &groups_to_watch {
+                            // Check if this machine is in the group
+                            let groups_file = config.mfs_mount
+                                .join("machines")
+                                .join(&hostname)
+                                .join("etc")
+                                .join("laszoo")
+                                .join("groups.conf");
+                            
+                            let in_group = if groups_file.exists() {
+                                let content = std::fs::read_to_string(&groups_file).unwrap_or_default();
+                                content.lines().any(|line| line.trim() == group_name)
+                            } else {
+                                false
+                            };
+                            
+                            if !in_group {
+                                continue;
+                            }
+                            
+                            // Check if there are any unexecuted commands
+                            if check_for_unexecuted_commands(&config, group_name).await {
+                                println!("\n[{}] Found unexecuted package commands for group '{}'",
+                                    chrono::Local::now().format("%H:%M:%S"),
+                                    group_name
+                                );
+                                println!("  → Auto-applying unexecuted commands...");
+                                if let Err(e) = apply_packages_for_group(config, group_name).await {
+                                    error!("Failed to apply package changes: {}", e);
+                                    println!("  ✗ Failed to apply package changes: {}", e);
+                                } else {
+                                    println!("  ✓ Package commands executed");
+                                }
+                            }
+                        }
+                    }
+                    
                     last_packages_scan = std::time::Instant::now();
                 }
             }
@@ -2352,11 +2466,15 @@ async fn handle_file_change(
 
         // File modified locally with converge - update template
         (true, true, SyncAction::Converge) => {
+            debug!("Converging local changes to template");
+            
             // Read current file content
             let file_content = std::fs::read_to_string(file_path)?;
+            debug!("Read {} bytes from local file", file_content.len());
 
             // Load template to preserve variables
             let template_content = std::fs::read_to_string(&template_path)?;
+            debug!("Read {} bytes from template", template_content.len());
 
             // Use template engine to merge changes while preserving variables
             let template_engine = TemplateEngine::new()?;
@@ -2364,9 +2482,11 @@ async fn handle_file_change(
                 &template_content,
                 &file_content,
             )?;
+            debug!("Merged template is {} bytes", updated_template.len());
 
             // Write updated template
             std::fs::write(&template_path, &updated_template)?;
+            debug!("Wrote updated template to: {}", template_path.display());
             info!("Updated template with local changes: {:?}", template_path);
             Ok(true)
         },
@@ -2417,91 +2537,75 @@ async fn handle_file_change(
 
 /// Load group configuration including triggers and sync action
 fn load_group_config(mfs_mount: &Path, group: &str) -> Result<(Option<String>, Option<String>, SyncAction)> {
-    use serde::{Serialize, Deserialize};
+    use crate::enrollment::EnrollmentManifest;
 
-    #[derive(Serialize, Deserialize, Default)]
-    struct GroupConfig {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        before_trigger: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        after_trigger: Option<String>,
-        sync_action: String,
-    }
-
-    let config_path = mfs_mount
+    // Load manifest.json to get sync_action and triggers
+    let manifest_path = mfs_mount
         .join("groups")
         .join(group)
-        .join("config.json");
+        .join("manifest.json");
 
-    if !config_path.exists() {
-        // Default to converge if no config exists
+    if !manifest_path.exists() {
+        // Default to converge if no manifest exists
         return Ok((None, None, SyncAction::Converge));
     }
 
-    let content = std::fs::read_to_string(&config_path)?;
-    let config: GroupConfig = serde_json::from_str(&content)?;
+    let content = std::fs::read_to_string(&manifest_path)?;
+    let manifest: EnrollmentManifest = serde_json::from_str(&content)?;
 
-    let sync_action = match config.sync_action.as_str() {
-        "rollback" => SyncAction::Rollback,
-        "freeze" => SyncAction::Freeze,
-        "drift" => SyncAction::Drift,
+    let sync_action = match manifest.sync_action.as_deref() {
+        Some("rollback") => SyncAction::Rollback,
+        Some("freeze") => SyncAction::Freeze,
+        Some("drift") => SyncAction::Drift,
         _ => SyncAction::Converge,
     };
 
-    Ok((config.before_trigger, config.after_trigger, sync_action))
+    Ok((manifest.before_trigger.clone(), manifest.after_trigger.clone(), sync_action))
 }
 
-/// Store group configuration including triggers and sync action
-fn store_group_config(
+
+/// Update manifest with sync action and triggers
+fn update_manifest_config(
     mfs_mount: &Path,
     group: &str,
     before: Option<&str>,
     after: Option<&str>,
     action: &SyncAction,
 ) -> Result<()> {
-    use serde::{Serialize, Deserialize};
+    use crate::enrollment::EnrollmentManifest;
 
-    #[derive(Serialize, Deserialize, Default)]
-    struct GroupConfig {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        before_trigger: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        after_trigger: Option<String>,
-        sync_action: String,
-    }
-
-    let config = GroupConfig {
-        before_trigger: before.map(|s| s.to_string()),
-        after_trigger: after.map(|s| s.to_string()),
-        sync_action: match action {
-            SyncAction::Converge => "converge".to_string(),
-            SyncAction::Rollback => "rollback".to_string(),
-            SyncAction::Freeze => "freeze".to_string(),
-            SyncAction::Drift => "drift".to_string(),
-        },
-    };
-
-    let config_path = mfs_mount
+    let manifest_path = mfs_mount
         .join("groups")
         .join(group)
-        .join("config.json");
+        .join("manifest.json");
 
-    // Ensure parent directory exists
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    // Load existing manifest
+    let mut manifest = EnrollmentManifest::load(&manifest_path)?;
 
-    let json = serde_json::to_string_pretty(&config)?;
-    std::fs::write(&config_path, json)?;
+    // Update fields
+    manifest.sync_action = Some(match action {
+        SyncAction::Converge => "converge".to_string(),
+        SyncAction::Rollback => "rollback".to_string(),
+        SyncAction::Freeze => "freeze".to_string(),
+        SyncAction::Drift => "drift".to_string(),
+    });
+    
+    manifest.before_trigger = before.map(|s| s.to_string());
+    manifest.after_trigger = after.map(|s| s.to_string());
 
-    info!("Stored group configuration for '{}'", group);
+    // Save the updated manifest
+    manifest.save(&manifest_path)?;
+
+    info!("Updated manifest configuration for group '{}'", group);
     if let Some(cmd) = before {
         info!("  Before trigger: {}", cmd);
     }
     if let Some(cmd) = after {
         info!("  After trigger: {}", cmd);
     }
-    info!("  Sync action: {:?}", action);
+    if let Some(sync_action) = &manifest.sync_action {
+        info!("  Sync action: {}", sync_action);
+    }
 
     Ok(())
 }
@@ -2593,6 +2697,78 @@ async fn install_packages(config: &Config, group: &str, packages: Vec<String>, a
     Ok(())
 }
 
+async fn check_for_unexecuted_commands(config: &Config, group: &str) -> bool {
+    use crate::package::PackageManager;
+    use std::collections::HashSet;
+    
+    let hostname = gethostname::gethostname()
+        .to_string_lossy()
+        .to_string();
+    
+    // Create package manager
+    let pkg_manager = PackageManager::new(config.mfs_mount.clone());
+    
+    // Load operations for this group
+    match pkg_manager.load_package_operations(group, Some(&hostname)) {
+        Ok(operations) => {
+            // Get command history
+            let history = match pkg_manager.get_command_history(group) {
+                Ok(h) => h,
+                Err(_) => return false,
+            };
+            
+            // Create a set of executed commands
+            let executed_commands: HashSet<String> = history
+                .into_iter()
+                .filter_map(|(cmd, _, executed)| {
+                    if executed.is_some() {
+                        Some(cmd)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            
+            // Check if any upgrade commands haven't been executed
+            for op in operations {
+                match op {
+                    crate::package::PackageOperation::UpdateAll { .. } => {
+                        if !executed_commands.contains("++update") {
+                            debug!("Found unexecuted command: ++update");
+                            return true;
+                        }
+                    }
+                    crate::package::PackageOperation::UpgradeAll { .. } => {
+                        if !executed_commands.contains("++upgrade") {
+                            debug!("Found unexecuted command: ++upgrade");
+                            return true;
+                        }
+                    }
+                    crate::package::PackageOperation::DistUpgradeAll { .. } => {
+                        if !executed_commands.contains("++dist-upgrade") {
+                            debug!("Found unexecuted command: ++dist-upgrade");
+                            return true;
+                        }
+                    }
+                    crate::package::PackageOperation::FullUpgradeAll { .. } => {
+                        if !executed_commands.contains("++full-upgrade") {
+                            debug!("Found unexecuted command: ++full-upgrade");
+                            return true;
+                        }
+                    }
+                    _ => {} // Individual package operations don't count as one-off commands
+                }
+            }
+            
+            false
+        }
+        Err(e) => {
+            debug!("Failed to load package operations: {}", e);
+            false
+        }
+    }
+}
+
 async fn apply_packages_for_group(config: &Config, group: &str) -> Result<()> {
     use crate::package::PackageManager;
     
@@ -2678,7 +2854,7 @@ async fn apply_machine_packages(config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn patch_group(config: &Config, group: &str, before: Option<&str>, after: Option<&str>, _rolling: bool) -> Result<()> {
+async fn patch_group(config: &Config, group: &str, before: Option<&str>, after: Option<&str>, _rolling: bool, full_upgrade: bool, dist_upgrade: bool) -> Result<()> {
     use crate::package::PackageManager;
     
     info!("Adding patch commands to group '{}'", group);
@@ -2689,9 +2865,15 @@ async fn patch_group(config: &Config, group: &str, before: Option<&str>, after: 
     // Create package manager
     let pkg_manager = PackageManager::new(config.mfs_mount.clone());
     
-    // Build the ++update and ++upgrade lines
+    // Build the ++update and upgrade lines
     let mut update_line = "++update".to_string();
-    let mut upgrade_line = "++upgrade".to_string();
+    let mut upgrade_line = if dist_upgrade {
+        "++dist-upgrade".to_string()
+    } else if full_upgrade {
+        "++full-upgrade".to_string()
+    } else {
+        "++upgrade".to_string()
+    };
     
     // Add before/after actions if provided
     if let Some(before_cmd) = before {
@@ -2716,12 +2898,19 @@ async fn patch_group(config: &Config, group: &str, before: Option<&str>, after: 
         std::fs::read_to_string(&packages_conf_path)?
     } else {
         // Create default header
-        "# Laszoo Package Configuration\n# Syntax:\n# ^package - Upgrade package\n# ^package --upgrade=command - Upgrade with post-action\n# ++update - Update package lists\n# ++update --before cmd --after cmd - Update with before/after actions\n# ++upgrade - Upgrade all packages\n# ++upgrade --before cmd --after cmd - Upgrade all with before/after actions\n# +package - Install package\n# =package - Keep package (don't auto-install/remove)\n# !package - Remove package\n# !!!package - Purge package\n\n".to_string()
+        "# Laszoo Package Configuration\n# Syntax:\n# ^package - Upgrade package\n# ^package --upgrade=command - Upgrade with post-action\n# ++update - Update package lists\n# ++update --before cmd --after cmd - Update with before/after actions\n# ++upgrade - Upgrade all packages\n# ++upgrade --before cmd --after cmd - Upgrade all with before/after actions\n# ++dist-upgrade - Distribution upgrade (Debian/Ubuntu)\n# ++full-upgrade - Full upgrade (Proxmox recommended)\n# +package - Install package\n# =package - Keep package (don't auto-install/remove)\n# !package - Remove package\n# !!!package - Purge package\n\n".to_string()
     };
     
-    // Check if ++update or ++upgrade already exist
+    // Check if ++update or the selected upgrade command already exist
     let has_update = content.lines().any(|line| line.trim().starts_with("++update"));
-    let has_upgrade = content.lines().any(|line| line.trim().starts_with("++upgrade"));
+    let upgrade_prefix = if dist_upgrade {
+        "++dist-upgrade"
+    } else if full_upgrade {
+        "++full-upgrade"
+    } else {
+        "++upgrade"
+    };
+    let has_upgrade = content.lines().any(|line| line.trim().starts_with(upgrade_prefix));
     
     // Append the patch commands if they don't exist
     if !has_update || !has_upgrade {
