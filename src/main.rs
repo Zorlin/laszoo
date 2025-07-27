@@ -2698,6 +2698,23 @@ fn update_manifest_config(
     Ok(())
 }
 
+fn is_laszoo_watch_running() -> bool {
+    use std::process::Command;
+    
+    // Check if the laszoo service is running
+    let output = Command::new("systemctl")
+        .args(&["is-active", "laszoo"])
+        .output();
+    
+    match output {
+        Ok(output) => {
+            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            status == "active"
+        }
+        Err(_) => false,
+    }
+}
+
 async fn add_machine_to_group(config: &Config, group: &str) -> Result<()> {
     let enrollment_manager = enrollment::EnrollmentManager::new(
         config.mfs_mount.clone(),
@@ -2749,16 +2766,19 @@ async fn install_packages(config: &Config, group: &str, packages: Vec<String>, a
         // Add this machine to the group
         add_machine_to_group(config, group).await?;
         
-        info!("Added machine to group '{}', applying package changes locally", group);
-    } else {
-        info!("This machine is in group '{}', applying package changes locally", group);
+        println!("Added machine to group '{}'", group);
     }
     
-    // Load operations for this machine
-    let operations = pkg_manager.load_package_operations(group, Some(&hostname))?;
+    // Check if laszoo watch is running
+    let watch_running = is_laszoo_watch_running();
     
-    // Apply operations
-    pkg_manager.apply_operations_with_group(&operations, Some(group)).await?;
+    if watch_running {
+        info!("Laszoo watch is running, it will handle package installation");
+    } else if in_group {
+        info!("Laszoo watch not detected, applying package changes locally");
+        // Apply the entire packages.conf for this group
+        apply_packages_for_group(config, group).await?;
+    }
     
     // Run after command if provided
     if let Some(cmd) = after {
@@ -2829,32 +2849,33 @@ async fn uninstall_packages(config: &Config, group: &str, packages: Vec<String>,
         return Ok(());
     }
     
-    // Run before command if provided
-    if let Some(cmd) = before {
-        info!("Running before command: {}", cmd);
-        use tokio::process::Command;
-        
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .output()
-            .await?;
-        
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!("Before command failed: {}", stderr);
+    // Check if laszoo watch is running
+    let watch_running = is_laszoo_watch_running();
+    
+    if watch_running {
+        info!("Laszoo watch is running, it will handle package removal");
+    } else {
+        // Run before command if provided
+        if let Some(cmd) = before {
+            info!("Running before command: {}", cmd);
+            use tokio::process::Command;
+            
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .output()
+                .await?;
+            
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!("Before command failed: {}", stderr);
+            }
         }
+        
+        // Apply the entire packages.conf for this group (which now includes the removal entries)
+        info!("Laszoo watch not detected, applying package changes locally");
+        apply_packages_for_group(config, group).await?;
     }
-    
-    // Uninstall packages locally
-    info!("Uninstalling packages locally");
-    let pkg_ops: Vec<crate::package::PackageOperation> = packages.iter()
-        .map(|pkg| crate::package::PackageOperation::Remove {
-            name: pkg.clone(),
-        })
-        .collect();
-    
-    pkg_manager.apply_operations_with_group(&pkg_ops, Some(group)).await?;
     
     // Run after command if provided
     if let Some(cmd) = after {

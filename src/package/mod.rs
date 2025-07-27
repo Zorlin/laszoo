@@ -466,31 +466,40 @@ impl PackageManager {
             Vec::new()
         };
 
-        // Create a set of existing package names for deduplication
-        let mut existing_names: HashSet<String> = existing_ops.iter().filter_map(|op| {
-            match op {
-                PackageOperation::Upgrade { name, .. } => Some(name.clone()),
-                PackageOperation::Install { name } => Some(name.clone()),
-                PackageOperation::Keep { name } => Some(name.clone()),
-                PackageOperation::Remove { name } => Some(name.clone()),
-                PackageOperation::Purge { name } => Some(name.clone()),
-                PackageOperation::UpdateAll { .. } => None, // UpdateAll doesn't have a package name
-                PackageOperation::UpgradeAll { .. } => None, // UpgradeAll doesn't have a package name
-                PackageOperation::DistUpgradeAll { .. } => None, // DistUpgradeAll doesn't have a package name
-                PackageOperation::FullUpgradeAll { .. } => None, // FullUpgradeAll doesn't have a package name
-            }
-        }).collect();
-
-        // Add new packages
+        // For each package to install, update or add the appropriate operation
         for package in packages {
-            if !existing_names.contains(package) {
+            // Find if this package already exists in the operations
+            let mut found = false;
+            for op in existing_ops.iter_mut() {
+                match op {
+                    PackageOperation::Upgrade { name, .. } |
+                    PackageOperation::Install { name } |
+                    PackageOperation::Keep { name } |
+                    PackageOperation::Remove { name } |
+                    PackageOperation::Purge { name } => {
+                        if name == package {
+                            // Replace the existing operation with install/upgrade
+                            *op = if upgrade {
+                                PackageOperation::Upgrade { name: package.clone(), post_action: None }
+                            } else {
+                                PackageOperation::Install { name: package.clone() }
+                            };
+                            found = true;
+                            break;
+                        }
+                    }
+                    _ => {} // Skip non-package operations
+                }
+            }
+            
+            // If not found, add new operation
+            if !found {
                 let op = if upgrade {
                     PackageOperation::Upgrade { name: package.clone(), post_action: None }
                 } else {
                     PackageOperation::Install { name: package.clone() }
                 };
                 existing_ops.push(op);
-                existing_names.insert(package.clone());
             }
         }
 
