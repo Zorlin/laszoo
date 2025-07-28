@@ -21,7 +21,8 @@
       "mcp__deepwiki__ask_question",
       "Bash(bash:*)",
       "Bash(sudo mkdir:*)",
-      "Bash(sudo chmod:*)"
+      "Bash(sudo chmod:*)",
+      "Bash(sudo ./target/release/laszoo playbook run:*)"
     ],
     "deny": []
   },

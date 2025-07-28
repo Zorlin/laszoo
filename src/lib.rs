@@ -14,3 +14,4 @@ pub mod service;
 pub mod webui;
 pub mod playbook;
 pub mod inventory;
+pub mod group_order;

@@ -6,6 +6,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Laszoo is a distributed configuration management tool that leverages MooseFS for zero-config clustering and automatic synchronization of configuration files across hosts.
 
+## Design Principles
+
+### Stateless Architecture
+Laszoo follows a stateless design where the filesystem structure represents the system state. This means:
+
+- Group membership is expressed through directories containing symlinks, not through YAML files listing hosts
+- Templates are stored as individual `.lasz` files in their respective directories
+- Relationships between entities use filesystem structure (directories and symlinks)
+- Operations are idempotent - running them multiple times produces the same result
+
+### When YAML files are appropriate
+YAML files are used for configuration data, not state tracking:
+- `group_vars/desktop` - Variables for the desktop group
+- `host_vars/green` - Variables specific to the green host
+- `/etc/laszoo/packages.conf` - Package configuration
+- These files contain configuration values, not lists of relationships or state
+
+### Filesystem conventions
+- Use timestamps in filenames when ordering matters
+- Express relationships through directory structure
+- Let the filesystem be the source of truth for system state
+
 ## Development Commands
 
 ### Building
@@ -99,6 +121,27 @@ sudo ./target/release/laszoo <command>  # Some operations require root
 - **Machine Templates**: `/mnt/laszoo/machines/<hostname>/<file-path>.lasz`
 - **Manifests**: `manifest.json` in group/machine directories
 - **Git Repository**: `/mnt/laszoo/.git/`
+
+### Inventory Structure (Jetpack)
+
+Jetpack uses its own inventory format:
+
+```
+/mnt/laszoo/inventory/jetpack/
+├── groups/
+│   ├── all           # Group file with hosts: and subgroups: lists
+│   ├── desktop       # Example: hosts: [green, blackberry]
+│   └── proxmox       # Example: hosts: [blue], subgroups: []
+├── group_vars/
+│   ├── all           # Variables for all group
+│   ├── desktop       # Variables for desktop group
+│   └── proxmox       # Variables for proxmox group
+└── host_vars/
+    ├── green         # Host-specific variables
+    └── blue          # Host-specific variables
+```
+
+Note: Jetpack's group files follow a specific format with `hosts:` and `subgroups:` keys. Group files, group_vars, and host_vars do NOT use .yml extensions.
 
 ### Critical Implementation Details
 

@@ -33,10 +33,12 @@ impl InventoryGenerator {
         let inventory_path = mount_point.join("inventory/jetpack");
         let groups_path = inventory_path.join("groups");
         let host_vars_path = inventory_path.join("host_vars");
+        let group_vars_path = inventory_path.join("group_vars");
 
         // Ensure inventory directories exist with proper permissions
         Self::ensure_directory_exists(&groups_path)?;
         Self::ensure_directory_exists(&host_vars_path)?;
+        Self::ensure_directory_exists(&group_vars_path)?;
 
         Ok(Self {
             mount_point,
@@ -84,9 +86,10 @@ impl InventoryGenerator {
     pub fn sync_from_laszoo_groups(&self, config: &Config) -> Result<()> {
         info!("Syncing inventory from Laszoo groups");
 
-        // Load group manifest
-        let group_manager = GroupManager::new(config.mfs_mount.clone(), String::new());
-        let manifest = group_manager.load_manifest()?;
+        // Read group membership from symlinks in /mnt/laszoo/memberships/
+        let memberships_dir = config.mfs_mount.join("memberships");
+        let mut groups: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut all_hosts: HashSet<String> = HashSet::new();
 
         // Clear existing group files (but not host_vars)
         if self.groups_path.exists() {
@@ -98,35 +101,67 @@ impl InventoryGenerator {
             }
         }
 
-        // Create a group file for each Laszoo group
-        for (group_name, group) in &manifest.groups {
-            self.create_group_file(group_name, &group.hosts)?;
+        if memberships_dir.exists() {
+            for entry in fs::read_dir(&memberships_dir)? {
+                let entry = entry?;
+                let group_path = entry.path();
+                
+                if !group_path.is_dir() {
+                    continue;
+                }
+                
+                let group_name = match group_path.file_name().and_then(|n| n.to_str()) {
+                    Some(name) => name.to_string(),
+                    None => continue,
+                };
+                
+                let mut hosts = HashSet::new();
+                
+                // Read symlinks in the group directory
+                for member_entry in fs::read_dir(&group_path)? {
+                    let member_entry = member_entry?;
+                    let member_path = member_entry.path();
+                    
+                    // Check if it's a symlink
+                    if let Ok(metadata) = member_path.symlink_metadata() {
+                        if metadata.file_type().is_symlink() {
+                            // Get the hostname from the symlink name
+                            if let Some(hostname) = member_path.file_name().and_then(|n| n.to_str()) {
+                                hosts.insert(hostname.to_string());
+                                all_hosts.insert(hostname.to_string());
+                            }
+                        }
+                    }
+                }
+                
+                if !hosts.is_empty() {
+                    groups.insert(group_name, hosts);
+                }
+            }
+        }
+
+        // Create a group file for each discovered group
+        for (group_name, hosts) in &groups {
+            self.create_group_file(group_name, hosts)?;
         }
 
         // Create an "all" group that includes all hosts
-        let all_hosts: HashSet<String> = manifest.groups.values()
-            .flat_map(|g| g.hosts.iter().cloned())
-            .collect();
-        
         if !all_hosts.is_empty() {
-            self.create_group_file("all", &all_hosts.into_iter().collect())?;
+            self.create_group_file("all", &all_hosts)?;
         }
 
-        // Create host_vars files for each unique host
-        let unique_hosts: HashSet<String> = manifest.groups.values()
-            .flat_map(|g| g.hosts.iter().cloned())
-            .collect();
-
-        for hostname in unique_hosts {
-            self.create_host_vars(&hostname)?;
+        // Create/update host_vars files for each unique host
+        // This must be done AFTER all groups are created so we can merge all group_vars
+        for hostname in &all_hosts {
+            self.create_host_vars(hostname)?;
         }
 
-        info!("Inventory sync completed");
+        info!("Inventory sync completed - found {} groups with {} total hosts", groups.len(), all_hosts.len());
         Ok(())
     }
 
     fn create_group_file(&self, group_name: &str, hosts: &HashSet<String>) -> Result<()> {
-        let group_file = self.groups_path.join(format!("{}.yml", group_name));
+        let group_file = self.groups_path.join(group_name);
         
         let jetpack_group = JetpackGroup {
             hosts: hosts.iter().cloned().collect::<Vec<_>>(),
@@ -143,7 +178,7 @@ impl InventoryGenerator {
     }
 
     fn create_host_vars(&self, hostname: &str) -> Result<()> {
-        let host_vars_file = self.host_vars_path.join(format!("{}.yml", hostname));
+        let host_vars_file = self.host_vars_path.join(hostname);
         
         // Check if host vars already exist
         if host_vars_file.exists() {
@@ -151,13 +186,17 @@ impl InventoryGenerator {
             return Ok(());
         }
 
-        // Create basic host vars
+        // Create basic host vars - DO NOT include merged group vars here for security
         let mut vars = HashMap::new();
         vars.insert("host".to_string(), JsonValue::String(hostname.to_string()));
         vars.insert("laszoo_managed".to_string(), JsonValue::Bool(true));
         
-        // Add any machine-specific variables from Laszoo
-        // This could be extended to read from machine-specific config files
+        // Load machine-specific variables from Laszoo
+        let machine_vars = self.load_machine_vars(hostname)?;
+        for (key, value) in machine_vars {
+            vars.insert(key, value);
+        }
+        
         let host_vars = JetpackHostVars { vars };
 
         let json_value = serde_json::to_value(&host_vars)?;
@@ -183,6 +222,148 @@ impl InventoryGenerator {
     pub fn get_inventory_path(&self) -> &Path {
         &self.inventory_path
     }
+    
+    /// Get merged variables for a host (machine vars + all group vars)
+    /// This is done dynamically at runtime for security - not stored on disk
+    pub fn get_merged_host_vars(&self, hostname: &str) -> Result<HashMap<String, JsonValue>> {
+        let mut merged_vars = HashMap::new();
+        
+        // Start with group vars (in order of precedence, least specific first)
+        let groups = self.get_groups_for_host(hostname)?;
+        for group in groups {
+            if let Ok(group_vars) = self.load_group_vars(&group) {
+                for (key, value) in group_vars {
+                    merged_vars.insert(key, value);
+                }
+            }
+        }
+        
+        // Machine-specific vars override group vars
+        let machine_vars = self.load_machine_vars(hostname)?;
+        for (key, value) in machine_vars {
+            merged_vars.insert(key, value);
+        }
+        
+        // Always add these base vars
+        merged_vars.insert("host".to_string(), JsonValue::String(hostname.to_string()));
+        merged_vars.insert("laszoo_managed".to_string(), JsonValue::Bool(true));
+        
+        Ok(merged_vars)
+    }
+    
+    /// Get all groups that a host belongs to
+    fn get_groups_for_host(&self, hostname: &str) -> Result<Vec<String>> {
+        let mut groups = Vec::new();
+        
+        // Check each group file to see if it contains this host
+        if self.groups_path.exists() {
+            for entry in fs::read_dir(&self.groups_path)? {
+                let entry = entry?;
+                let path = entry.path();
+                
+                if path.extension().and_then(|s| s.to_str()) == Some("yml") {
+                    let content = fs::read_to_string(&path)?;
+                    if content.contains(hostname) {
+                        // Parse more carefully to ensure it's actually in the hosts list
+                        if let Some(group_name) = path.file_stem().and_then(|s| s.to_str()) {
+                            // Simple check - could be made more robust with proper YAML parsing
+                            if content.contains(&format!("- {}", hostname)) {
+                                groups.push(group_name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(groups)
+    }
+    
+    /// Load group_vars for a specific group
+    fn load_group_vars(&self, group_name: &str) -> Result<HashMap<String, JsonValue>> {
+        let group_vars_path = self.inventory_path.join("group_vars").join(group_name);
+        let mut vars = HashMap::new();
+        
+        if group_vars_path.exists() {
+            let content = fs::read_to_string(&group_vars_path)?;
+            
+            // Parse YAML-style key: value pairs
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                
+                if let Some((key, value)) = line.split_once(':') {
+                    let key = key.trim().to_string();
+                    let value = value.trim();
+                    
+                    // Convert to appropriate JSON value
+                    let json_value = if value == "true" {
+                        JsonValue::Bool(true)
+                    } else if value == "false" {
+                        JsonValue::Bool(false)
+                    } else if let Ok(num) = value.parse::<i64>() {
+                        JsonValue::Number(num.into())
+                    } else if let Ok(num) = value.parse::<f64>() {
+                        JsonValue::Number(serde_json::Number::from_f64(num).unwrap_or(0.into()))
+                    } else {
+                        JsonValue::String(value.to_string())
+                    };
+                    
+                    vars.insert(key, json_value);
+                }
+            }
+        }
+        
+        Ok(vars)
+    }
+    
+    /// Load machine-specific vars from Laszoo machine directory
+    fn load_machine_vars(&self, hostname: &str) -> Result<HashMap<String, JsonValue>> {
+        let mut vars = HashMap::new();
+        
+        // Check for vars in /mnt/laszoo/machines/<hostname>/etc/laszoo/vars.yml
+        let machine_vars_path = self.mount_point
+            .join("machines")
+            .join(hostname)
+            .join("etc/laszoo/vars.yml");
+            
+        if machine_vars_path.exists() {
+            let content = fs::read_to_string(&machine_vars_path)?;
+            
+            // Parse YAML-style key: value pairs
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                
+                if let Some((key, value)) = line.split_once(':') {
+                    let key = key.trim().to_string();
+                    let value = value.trim();
+                    
+                    let json_value = if value == "true" {
+                        JsonValue::Bool(true)
+                    } else if value == "false" {
+                        JsonValue::Bool(false)
+                    } else if let Ok(num) = value.parse::<i64>() {
+                        JsonValue::Number(num.into())
+                    } else if let Ok(num) = value.parse::<f64>() {
+                        JsonValue::Number(serde_json::Number::from_f64(num).unwrap_or(0.into()))
+                    } else {
+                        JsonValue::String(value.to_string())
+                    };
+                    
+                    vars.insert(key, json_value);
+                }
+            }
+            
+            debug!("Loaded {} machine-specific vars for {}", vars.len(), hostname);
+        }
+        
+        Ok(vars)
+    }
 
     pub fn create_dynamic_inventory_script(&self) -> Result<()> {
         // Create a dynamic inventory script that reads from the YAML files
@@ -207,8 +388,8 @@ def main():
     # Load groups
     if os.path.exists(groups_dir):
         for filename in os.listdir(groups_dir):
-            if filename.endswith('.yml'):
-                group_name = filename[:-4]
+            if filename not in ['hosts', 'host_vars', 'group_vars'] and not filename.startswith('.'):
+                group_name = filename
                 with open(os.path.join(groups_dir, filename), 'r') as f:
                     group_data = yaml.safe_load(f)
                     inventory[group_name] = {
@@ -219,8 +400,8 @@ def main():
     # Load host vars
     if os.path.exists(host_vars_dir):
         for filename in os.listdir(host_vars_dir):
-            if filename.endswith('.yml'):
-                host_name = filename[:-4]
+            if not filename.startswith('.'):
+                host_name = filename
                 with open(os.path.join(host_vars_dir, filename), 'r') as f:
                     host_data = yaml.safe_load(f)
                     inventory['_meta']['hostvars'][host_name] = host_data

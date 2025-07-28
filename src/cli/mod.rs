@@ -285,6 +285,10 @@ pub enum PlaybookCommands {
         #[arg(short, long)]
         inventory: Option<PathBuf>,
         
+        /// Enable verbose output
+        #[arg(short, long)]
+        verbose: bool,
+        
         /// Additional arguments to pass to the playbook
         #[arg(last = true)]
         args: Vec<String>,
@@ -372,4 +376,7 @@ pub enum GroupCommands {
 pub enum GroupsCommands {
     /// List all groups
     List,
+    
+    /// Manage group hierarchy and variable precedence order
+    Order,
 }

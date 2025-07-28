@@ -77,6 +77,7 @@ fn requires_root(command: &Commands) -> bool {
         Init { .. } => false,
         Groups { command } => match command {
             GroupsCommands::List => false,
+            GroupsCommands::Order => false,
         },
         Diff { .. } => false,
         WebUI { .. } => false,
@@ -1577,6 +1578,15 @@ async fn handle_groups_command(command: GroupsCommands) -> Result<()> {
                     );
                 }
             }
+        }
+        GroupsCommands::Order => {
+            info!("Opening group hierarchy editor");
+            
+            use laszoo::group_order::GroupOrderTui;
+            let mut tui = GroupOrderTui::new(config.mfs_mount.clone())
+                .map_err(|e| LaszooError::Other(e.to_string()))?;
+            tui.run().await
+                .map_err(|e| LaszooError::Other(e.to_string()))?;
         }
     }
 
@@ -3916,6 +3926,7 @@ async fn handle_playbook_command(config: &Config, command: PlaybookCommands) -> 
                     if metadata_path.exists() {
                         if let Ok(content) = std::fs::read_to_string(&metadata_path) {
                             if let Ok(metadata) = serde_json::from_str::<crate::playbook::PlaybookMetadata>(&content) {
+                                println!("    Main file: {}", metadata.main_file);
                                 if let Some(desc) = &metadata.description {
                                     println!("    Description: {}", desc);
                                 }
@@ -3930,14 +3941,20 @@ async fn handle_playbook_command(config: &Config, command: PlaybookCommands) -> 
                 }
             }
         }
-        PlaybookCommands::Run { name, inventory, args } => {
+        PlaybookCommands::Run { name, inventory, verbose, args } => {
             // Ensure inventory is synced before running
             let inventory_gen = InventoryGenerator::new(config)
                 .map_err(|e| LaszooError::Other(e.to_string()))?;
             inventory_gen.sync_from_laszoo_groups(config)
                 .map_err(|e| LaszooError::Other(e.to_string()))?;
             
-            playbook_manager.run_playbook(&name, inventory, args)
+            // Add verbose flag to args if specified
+            let mut final_args = args;
+            if verbose {
+                final_args.push("--verbose".to_string());
+            }
+            
+            playbook_manager.run_playbook(&name, inventory, final_args)
                 .map_err(|e| LaszooError::Other(e.to_string()))?;
         }
         PlaybookCommands::Remove { name } => {
